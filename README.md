@@ -4,123 +4,7 @@ Photo Map is a desktop application that scans a folder of photos, reads the GPS 
 
 Click any marker to see a thumbnail of the photo, rename it, write a note, flag its GPS data as incorrect, or change its pin color. Use **Quick Rename** mode to cycle through every photo in a single keyboard-driven workflow. All your annotations — notes, flags, pin colors, and map labels — are saved to a sidecar file (`photo-map-data.json`) stored inside your photo folder, so the data travels with the photos if you move or share them.
 
----
-
-## Prerequisites
-
-**To run from source:**
-- Node.js 18 or higher — download from https://nodejs.org
-
-**To build a distributable installer:**
-- Windows: Visual Studio C++ Build Tools (see Build section)
-- macOS: Xcode Command Line Tools (`xcode-select --install`)
-- Linux: `build-essential` (`sudo apt install build-essential`)
-
-**A Google Maps API key** with the **Maps JavaScript API** enabled:
-1. Go to https://console.cloud.google.com
-2. Create or select a project
-3. Go to **APIs & Services → Library** and enable **Maps JavaScript API**
-4. Go to **APIs & Services → Credentials** and create an **API Key**
-5. Copy the key — you will paste it into the app on first launch
-
----
-
-## Install & Run (from source)
-
-```bash
-# 1. Unzip the project and open a terminal in the photo-map folder
-
-# 2. Install dependencies
-npm install
-
-# 3. Start the app
-npm start
-```
-
 On first launch the app will ask for your Google Maps API key and your photo folder. These are saved automatically for future launches.
-
----
-
-## Build a Distributable Installer
-
-The installer bundles everything — Chromium, Node.js, all dependencies — so recipients need nothing pre-installed.
-
-### Windows
-
-```powershell
-# One-time setup: install C++ Build Tools (needed to compile sharp)
-npm install --global windows-build-tools
-
-# Build the installer
-npm run build:win
-```
-
-Output: `dist/Photo Map Setup.exe`
-
-### macOS
-
-```bash
-# Generate the .icns app icon (required — only works on macOS)
-iconutil -c icns assets/icons/icon.iconset -o assets/icons/icon.icns
-
-# Build the DMG
-npm run build:mac
-```
-
-Output: `dist/Photo Map.dmg` (contains both Intel x64 and Apple Silicon arm64 builds)
-
-### Linux
-
-```bash
-npm run build:linux
-```
-
-Output: `dist/Photo Map.AppImage` and `dist/Photo Map.deb`
-
-> **Note:** Each build command runs `electron-rebuild` first to recompile `sharp`'s native bindings for Electron's bundled Node.js runtime. This is automatic — you don't need to do anything extra.
-
----
-
-## How It Works
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Electron App                                   │
-│                                                                             │
-│  ┌──────────────────────────┐  IPC messages  ┌─────────────────────────┐   │
-│  │      Main Process        │ ◄────────────► │    Renderer Process     │   │
-│  │      (main.js)           │                │    (index.html +        │   │
-│  │                          │  preload.js    │     renderer.js)        │   │
-│  │  • Reads/writes files    │  creates a     │                         │   │
-│  │  • Scans EXIF data       │  safe bridge   │  • Google Maps UI       │   │
-│  │  • Makes thumbnails      │  called        │  • Photo pin markers    │   │
-│  │    (worker thread)       │  window        │  • Info panel + undo    │   │
-│  │  • Renames files         │  .photoMap     │  • Quick Rename mode    │   │
-│  │  • Manages lock file     │                │  • Settings + export    │   │
-│  │  • Watches folder        │                │  • Lock error screen    │   │
-│  │  • Exports GeoJSON/CSV   │                │                         │   │
-│  └──────────────────────────┘                └─────────────────────────┘   │
-│                                                                             │
-│  electron-store: saves API key, folder path, sidebar width, pin color      │
-│  photo-map-data.json: lives in your photo folder, stores all annotations   │
-│    (notes, bad-GPS flags, pin colors, map labels)                          │
-│  photo-map-data.lock: created when a folder is opened, deleted on close    │
-│    — prevents two users editing annotations at the same time               │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-External services:
-  Google Maps JavaScript API — loaded in the renderer via <script> tag
-```
-
-**Startup sequence:**
-1. `main.js` creates the window and loads `index.html`
-2. `preload.js` injects `window.photoMap` into the page
-3. `renderer.js` loads saved settings and shows the setup screen (pre-populated with last-used values)
-4. User clicks **Open Map →** — the app acquires the folder lock
-5. Google Maps loads and the folder is scanned (live progress shown in the status bar)
-6. HEIC thumbnail generation runs in a background worker thread so the UI stays responsive
-7. A marker is placed on the map for each photo that has GPS coordinates
-8. `chokidar` starts watching the folder for new or deleted photos
 
 ---
 
@@ -216,6 +100,49 @@ This was a bug in early development that has been fixed since build 1.0.0. After
 - Delete `node_modules` and run `npm install` again
 - On macOS, if the built app won't open, right-click it and choose "Open" to bypass Gatekeeper
 - Check the developer console (View → Toggle Developer Tools) for JavaScript errors
+
+---
+
+## How It Works
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                              Electron App                                 │
+│                                                                           │
+│  ┌──────────────────────────┐  IPC messages  ┌─────────────────────────┐  │
+│  │      Main Process        │ ◄────────────► │    Renderer Process     │  │
+│  │      (main.js)           │                │    (index.html +        │  │
+│  │                          │  preload.js    │     renderer.js)        │  │
+│  │  • Reads/writes files    │  creates a     │                         │  │
+│  │  • Scans EXIF data       │  safe bridge   │  • Google Maps UI       │  │
+│  │  • Makes thumbnails      │  called        │  • Photo pin markers    │  │
+│  │    (worker thread)       │  window        │  • Info panel + undo    │  │
+│  │  • Renames files         │  .photoMap     │  • Quick Rename mode    │  │
+│  │  • Manages lock file     │                │  • Settings + export    │  │
+│  │  • Watches folder        │                │  • Lock error screen    │  │
+│  │  • Exports GeoJSON/CSV   │                │                         │  │
+│  └──────────────────────────┘                └─────────────────────────┘  │
+│                                                                           │
+│  electron-store: saves API key, folder path, sidebar width, pin color     │
+│  photo-map-data.json: lives in your photo folder, stores all annotations  │
+│    (notes, bad-GPS flags, pin colors, map labels)                         │
+│  photo-map-data.lock: created when a folder is opened, deleted on close   │
+│    — prevents two users editing annotations at the same time              │
+└───────────────────────────────────────────────────────────────────────────┘
+
+External services:
+  Google Maps JavaScript API — loaded in the renderer via <script> tag
+```
+
+**Startup sequence:**
+1. `main.js` creates the window and loads `index.html`
+2. `preload.js` injects `window.photoMap` into the page
+3. `renderer.js` loads saved settings and shows the setup screen (pre-populated with last-used values)
+4. User clicks **Open Map →** — the app acquires the folder lock
+5. Google Maps loads and the folder is scanned (live progress shown in the status bar)
+6. HEIC thumbnail generation runs in a background worker thread so the UI stays responsive
+7. A marker is placed on the map for each photo that has GPS coordinates
+8. `chokidar` starts watching the folder for new or deleted photos
 
 ---
 
