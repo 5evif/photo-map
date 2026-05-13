@@ -1,0 +1,148 @@
+# ─── Photo Map — Cross-Platform Build Workflow ─────────────────────────────────
+#
+# Triggered whenever you push a tag that starts with "v" (e.g. v1.0.0).
+# Builds the app on three separate machines simultaneously:
+#   - Windows  → Photo Map Setup.exe   (NSIS installer)
+#   - macOS    → Photo Map.dmg         (universal: Intel + Apple Silicon)
+#   - Linux    → Photo Map.AppImage    (portable) + Photo Map.deb (Debian/Ubuntu)
+#
+# The finished installers are attached to a GitHub Release automatically.
+#
+# HOW TO TRIGGER A BUILD:
+#   git tag v1.0.0
+#   git push origin v1.0.0
+#
+# The release will appear at:
+#   https://github.com/YOUR-USERNAME/photo-map/releases
+
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'          # Runs on any tag starting with "v", e.g. v1.0.0, v1.2.3
+
+jobs:
+
+  # ── Windows build ─────────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Rebuild native modules for Electron
+        run: npx electron-rebuild -f -w sharp
+
+      - name: Build Windows installer
+        run: npx electron-builder --win
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload installer to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.exe
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── macOS build ───────────────────────────────────────────────────────────────
+  build-mac:
+    name: macOS
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate macOS app icon (.icns)
+        # iconutil is a macOS-only tool — this is the only place it can run.
+        # It reads the icon.iconset folder and writes icon.icns for the DMG.
+        run: iconutil -c icns assets/icons/icon.iconset -o assets/icons/icon.icns
+
+      - name: Rebuild native modules for Electron
+        run: npx electron-rebuild -f -w sharp
+
+      - name: Build macOS DMG
+        run: npx electron-builder --mac
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload DMG to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.dmg
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Linux build ───────────────────────────────────────────────────────────────
+  build-linux:
+    name: Linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install system dependencies for sharp and electron-builder
+        # These packages are needed to compile sharp's native bindings on Linux
+        # and to package the Electron app as an AppImage and .deb file.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libvips-dev \
+            rpm \
+            fakeroot \
+            dpkg
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Rebuild native modules for Electron
+        run: npx electron-rebuild -f -w sharp
+
+      - name: Build Linux packages
+        run: npx electron-builder --linux
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload AppImage and .deb to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.AppImage
+            dist/*.deb
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

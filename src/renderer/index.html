@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<!--
+  index.html — The Main Window
+
+  Defines the structure of every screen and panel in the app:
+    - Setup / onboarding screen (first launch)
+    - Main map view with toolbar
+    - Right sidebar (resizable) with: photo info, rename, notes, bad-GPS flag
+    - Left sidebar: photo list / browser
+    - Settings overlay
+    - Label popup (add / edit map text labels)
+    - Lightbox (full-screen photo zoom)
+    - Auth error banner
+
+  Logic lives in renderer.js.  Styling lives in styles.css.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Photo Map</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- ══════════════════════════════════════════════════════
+       SETUP SCREEN — shown on first launch
+  ══════════════════════════════════════════════════════ -->
+  <div id="setup-screen" class="screen hidden">
+    <div class="setup-card">
+      <div class="setup-logo">📍</div>
+      <h1>Welcome to Photo Map</h1>
+      <p class="setup-subtitle">See where your photos were taken on an interactive map.</p>
+
+      <div class="setup-section">
+        <label for="api-key-input">
+          Google Maps API Key
+          <a href="https://console.cloud.google.com" class="help-link" id="gcloud-link">Get one here →</a>
+        </label>
+        <input type="text" id="api-key-input" placeholder="AIzaSy…" autocomplete="off" spellcheck="false"/>
+        <p class="field-hint">Enable "Maps JavaScript API" in your Google Cloud project.</p>
+      </div>
+
+      <div class="setup-section">
+        <label for="folder-path-input">Photo Folder</label>
+        <div class="folder-input-row">
+          <input type="text" id="folder-path-input" placeholder="/Users/you/Photos" readonly/>
+          <button id="browse-btn" class="btn btn-secondary">Browse…</button>
+        </div>
+        <p class="field-hint">The app will scan this folder for photos with GPS data.</p>
+      </div>
+
+      <div id="setup-error" class="error-banner hidden"></div>
+      <button id="setup-continue-btn" class="btn btn-primary btn-large">Open Map →</button>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       MAIN APP VIEW
+  ══════════════════════════════════════════════════════ -->
+  <div id="app-view" class="screen hidden">
+
+    <!-- Toolbar -->
+    <div id="toolbar">
+      <div class="toolbar-left">
+        <span class="app-title">📍 Photo Map</span>
+      </div>
+      <div class="toolbar-center">
+        <span id="folder-name" class="folder-name" title="Current photo folder"></span>
+      </div>
+      <div class="toolbar-actions">
+        <button id="toggle-list-btn"    class="btn btn-toolbar" title="Show / hide photo list">☰ Photos</button>
+        <button id="quick-rename-btn"   class="btn btn-toolbar" title="Cycle through photos and rename them">✏ Quick Rename</button>
+        <button id="add-label-btn"      class="btn btn-toolbar" title="Add a text label to the map">+ Label</button>
+        <button id="rescan-btn"         class="btn btn-toolbar" title="Re-scan the photo folder">↻ Refresh</button>
+        <button id="settings-btn"       class="btn btn-toolbar" title="Open settings">⚙ Settings</button>
+      </div>
+    </div>
+
+    <!-- Body: list + map + sidebar -->
+    <div id="app-body">
+
+      <!-- Left: photo list panel (shown via toolbar toggle) -->
+      <div id="photo-list-panel" class="hidden">
+        <div class="list-header">
+          <span>Photos with GPS</span>
+          <input type="text" id="list-search" placeholder="Search…" />
+          <div class="list-filters">
+            <button class="btn btn-filter active" data-filter="all">All</button>
+            <button class="btn btn-filter" data-filter="bad"  title="Show only photos flagged as bad GPS">⚠ Bad GPS</button>
+            <button class="btn btn-filter" data-filter="note" title="Show only photos with notes">📝 Has Note</button>
+          </div>
+        </div>
+        <div id="photo-list-items"></div>
+      </div>
+
+      <!-- Centre: map -->
+      <div id="map"></div>
+
+      <!-- Resize handle between map and right panel -->
+      <div id="sidebar-resize-handle" title="Drag to resize"></div>
+
+      <!-- Right: info sidebar -->
+      <div id="info-panel" class="hidden">
+        <div class="panel-header">
+          <h2>Photo Details</h2>
+          <button id="close-panel-btn" class="btn btn-icon" title="Close">✕</button>
+        </div>
+
+        <div class="panel-body">
+
+          <!-- Thumbnail with zoom button -->
+          <div id="photo-thumbnail-container">
+            <img id="photo-thumbnail" src="" alt="Photo thumbnail"/>
+            <div id="thumbnail-loading" class="loading-spinner">Loading…</div>
+            <button id="zoom-btn" class="btn btn-zoom" title="View full size">⤢</button>
+          </div>
+
+          <!-- Rename -->
+          <div class="detail-section">
+            <label>Filename</label>
+            <div class="rename-row">
+              <input type="text" id="rename-input" placeholder="filename"/>
+              <span id="rename-ext" class="ext-label">.jpg</span>
+              <button id="rename-btn"      class="btn btn-secondary btn-small">Rename</button>
+              <button id="undo-rename-btn" class="btn btn-secondary btn-small hidden" title="Undo the last rename (Cmd/Ctrl+Z)">↩ Undo</button>
+            </div>
+            <div id="rename-error"   class="error-inline  hidden"></div>
+            <div id="rename-success" class="success-inline hidden">✓ Renamed</div>
+          </div>
+
+          <!-- Date & coords -->
+          <div class="detail-section">
+            <label>Date Taken</label>
+            <span id="photo-date" class="detail-value">—</span>
+          </div>
+          <div class="detail-section">
+            <label>Coordinates</label>
+            <span id="photo-coords" class="detail-value">—</span>
+          </div>
+
+          <!-- Notes -->
+          <div class="detail-section">
+            <label>Notes</label>
+            <textarea id="photo-notes" rows="3" placeholder="Add a note about this photo…"></textarea>
+            <div class="note-actions">
+              <button id="save-note-btn"    class="btn btn-secondary btn-small">Save Note</button>
+              <button id="undo-note-btn"    class="btn btn-secondary btn-small hidden" title="Undo the last note save">↩ Undo</button>
+              <span   id="note-saved-msg"   class="success-inline hidden">✓ Saved</span>
+            </div>
+          </div>
+
+          <!-- Bad GPS flag -->
+          <div class="detail-section flag-section">
+            <label class="checkbox-label">
+              <input type="checkbox" id="bad-gps-checkbox"/>
+              <span>⚠ Mark GPS data as incorrect</span>
+            </label>
+            <p class="field-hint">Removes the pin from the map.</p>
+          </div>
+
+          <!-- Per-photo pin color -->
+          <div class="detail-section">
+            <label>Pin Colour <span class="field-hint-inline">(overrides global)</span></label>
+            <div class="color-row">
+              <input type="color" id="photo-pin-color" value="#4f8ef7"/>
+              <button id="reset-pin-color-btn" class="btn btn-secondary btn-small">Use Global</button>
+            </div>
+          </div>
+
+          <!-- Actions -->
+          <div class="panel-actions">
+            <button id="show-in-finder-btn" class="btn btn-secondary">Show in Folder</button>
+          </div>
+
+        </div><!-- /.panel-body -->
+      </div><!-- /#info-panel -->
+
+    </div><!-- /#app-body -->
+
+    <!-- Status bar -->
+    <div id="status-bar">
+      <span id="status-text">Scanning photos…</span>
+    </div>
+
+  </div><!-- /#app-view -->
+
+  <!-- ══════════════════════════════════════════════════════
+       LIGHTBOX — full-screen photo zoom
+  ══════════════════════════════════════════════════════ -->
+  <div id="lightbox" class="hidden">
+    <button id="lightbox-close" class="btn btn-icon lightbox-close" title="Close">✕</button>
+    <div id="lightbox-inner">
+      <img id="lightbox-img" src="" alt="Full size photo"/>
+    </div>
+    <div id="lightbox-caption"></div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       SETTINGS OVERLAY
+  ══════════════════════════════════════════════════════ -->
+  <div id="settings-overlay" class="overlay hidden">
+    <div class="overlay-card">
+      <div class="overlay-header">
+        <h2>Settings</h2>
+        <button id="close-settings-btn" class="btn btn-icon">✕</button>
+      </div>
+
+      <div class="settings-section">
+        <label for="settings-api-key">Google Maps API Key</label>
+        <input type="text" id="settings-api-key" placeholder="AIzaSy…" spellcheck="false"/>
+        <p class="field-hint">Changes take effect after the app reloads.</p>
+      </div>
+
+      <div class="settings-section">
+        <label>Photo Folder</label>
+        <div class="folder-input-row">
+          <input type="text" id="settings-folder" readonly/>
+          <button id="settings-browse-btn" class="btn btn-secondary">Change…</button>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <label class="checkbox-label">
+          <input type="checkbox" id="settings-recursive"/>
+          <span>Scan subfolders</span>
+        </label>
+      </div>
+
+      <div class="settings-section">
+        <label class="checkbox-label">
+          <input type="checkbox" id="settings-show-labels" checked/>
+          <span>Show map labels</span>
+        </label>
+      </div>
+
+      <!-- Global pin color -->
+      <div class="settings-section">
+        <label>Default Pin Colour</label>
+        <div class="color-row">
+          <input type="color" id="settings-pin-color" value="#4f8ef7"/>
+          <span class="field-hint">Applied to all pins that don't have an individual colour set.</span>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <label>Export Annotations</label>
+        <div class="button-row">
+          <button id="export-geojson-btn" class="btn btn-secondary btn-small">Export GeoJSON</button>
+          <button id="export-csv-btn"     class="btn btn-secondary btn-small">Export CSV</button>
+        </div>
+        <p class="field-hint">GeoJSON works with mapping tools (QGIS, ArcGIS). CSV opens in Excel.</p>
+      </div>
+
+      <div class="settings-section">
+        <label>Thumbnail Cache</label>
+        <button id="clear-cache-btn" class="btn btn-danger btn-small">Clear All Thumbnails</button>
+        <p class="field-hint">Frees up disk space. Thumbnails regenerate on demand.</p>
+      </div>
+
+      <div id="settings-message" class="settings-message hidden"></div>
+
+      <div class="overlay-footer">
+        <button id="save-settings-btn"   class="btn btn-primary">Save &amp; Reload</button>
+        <button id="cancel-settings-btn" class="btn btn-secondary">Cancel</button>
+        <button id="view-readme-btn"     class="btn btn-secondary">📖 README</button>
+      </div>
+
+      <div class="about-section">
+        <div class="about-divider"></div>
+        <p class="about-title">Photo Map</p>
+        <p class="about-meta">Build 1.0.0 &nbsp;·&nbsp; 2026-05-09</p>
+        <p class="about-credit">Built by Alex Tyler &amp; Claude</p>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       LABEL POPUP — appears on map for add / edit
+  ══════════════════════════════════════════════════════ -->
+  <div id="label-popup" class="label-popup hidden">
+    <div class="label-popup-header">
+      <span id="label-popup-title">New Label</span>
+      <button id="close-label-popup-btn" class="btn btn-icon btn-small">✕</button>
+    </div>
+    <input type="text" id="label-text-input" placeholder="Label text…" maxlength="100"/>
+    <div class="label-size-row">
+      <label>Size:</label>
+      <select id="label-size-select">
+        <option value="small">Small</option>
+        <option value="medium" selected>Medium</option>
+        <option value="large">Large</option>
+      </select>
+    </div>
+    <div class="label-popup-actions">
+      <button id="save-label-btn"   class="btn btn-primary btn-small">Place Label</button>
+      <button id="delete-label-btn" class="btn btn-danger  btn-small hidden">Delete</button>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       AUTH ERROR BANNER
+  ══════════════════════════════════════════════════════ -->
+  <div id="auth-error-banner" class="auth-error-banner hidden">
+    <strong>⚠ Google Maps API key error.</strong>
+    Go to <a href="#" id="auth-error-settings-link">Settings</a> to update your key.
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       QUICK RENAME OVERLAY
+       Two-column layout:
+         Left  — mini map (top) + notes/bad-GPS (bottom)
+         Right — large photo + rename bar
+  ══════════════════════════════════════════════════════ -->
+  <div id="quick-rename-overlay" class="hidden">
+
+    <!-- Top bar: counter + close button pinned to the top right -->
+    <div id="qr-topbar">
+      <div class="qr-topbar-right">
+        <span id="qr-counter"></span>
+        <button id="qr-close-btn" class="btn btn-icon qr-close" title="Exit Quick Rename (Esc)">✕</button>
+      </div>
+    </div>
+
+    <!-- Two columns -->
+    <div id="qr-body">
+
+      <!-- LEFT: mini map (top) + notes + bad GPS (bottom) -->
+      <div id="qr-map-panel">
+
+        <!-- Mini map -->
+        <div id="qr-map-top">
+          <div id="qr-map-label">Location</div>
+          <div id="qr-map"></div>
+          <div id="qr-coords"></div>
+        </div>
+
+        <!-- Notes + bad GPS stacked below the map -->
+        <div id="qr-map-bottom">
+          <div class="qr-side-section">
+            <label class="qr-side-label">Notes</label>
+            <textarea id="qr-notes" placeholder="Add a note about this photo…"></textarea>
+            <div class="note-actions">
+              <button id="qr-save-note-btn" class="btn btn-secondary btn-small">Save Note</button>
+              <button id="qr-undo-note-btn" class="btn btn-secondary btn-small hidden" title="Undo the last note save">↩ Undo</button>
+              <span id="qr-note-saved" class="success-inline hidden">✓ Saved</span>
+            </div>
+          </div>
+
+          <div class="qr-side-section qr-flag-section">
+            <label class="qr-side-label">GPS</label>
+            <label class="checkbox-label qr-bad-gps-label" id="qr-bad-gps-label" title="Click or press Tab to toggle">
+              <input type="checkbox" id="qr-bad-gps-checkbox"/>
+              <span>⚠ Mark GPS as incorrect</span>
+            </label>
+            <p class="field-hint">Removes the pin from the map. Hotkey: <kbd>Tab</kbd></p>
+          </div>
+        </div>
+
+      </div><!-- /#qr-map-panel -->
+
+      <!-- RIGHT: photo + rename bar -->
+      <div id="qr-centre">
+        <div id="qr-photo-area">
+          <img id="qr-photo-img" src="" alt=""/>
+          <div id="qr-loading" class="qr-loading">Loading…</div>
+          <button id="qr-zoom-btn" class="btn btn-zoom qr-zoom-btn hidden" title="View full size (zoom/pan)">⤢</button>
+        </div>
+
+        <div id="qr-rename-bar">
+          <div id="qr-rename-row">
+            <input type="text" id="qr-name-input" spellcheck="false" autocomplete="off"/>
+            <span id="qr-ext" class="qr-ext"></span>
+            <button id="qr-save-btn"   class="btn btn-primary">Save &amp; Next ↵</button>
+            <button id="qr-skip-btn"   class="btn btn-secondary">Skip →</button>
+            <button id="qr-undo-btn"   class="btn btn-secondary hidden" title="Undo last change and go back">↩ Undo</button>
+          </div>
+          <div id="qr-error" class="error-inline hidden"></div>
+          <p class="qr-hint">Enter · save &amp; next &nbsp;|&nbsp; Tab · toggle bad GPS &nbsp;|&nbsp; Esc · exit</p>
+        </div>
+      </div><!-- /#qr-centre -->
+
+    </div><!-- /#qr-body -->
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       LOCK ERROR OVERLAY
+       Shown when the photo folder's metadata file is locked
+       by another user, or when the folder is read-only.
+       Blocks all app activity until resolved.
+  ══════════════════════════════════════════════════════ -->
+  <div id="lock-overlay" class="screen hidden lock-overlay">
+    <div class="lock-card">
+      <div class="lock-icon">🔒</div>
+      <h2 id="lock-title">Folder In Use</h2>
+      <p  id="lock-message" class="lock-message"></p>
+      <div id="lock-detail" class="lock-detail hidden"></div>
+      <div class="lock-actions">
+        <button id="lock-retry-btn"    class="btn btn-primary">Retry</button>
+        <button id="lock-settings-btn" class="btn btn-secondary">Choose Different Folder</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       README VIEWER OVERLAY
+       Full-screen read-only view of README.md.
+       Markdown is rendered to formatted HTML inside the app.
+       Opened from the Settings panel; closed with ✕ or Esc.
+  ══════════════════════════════════════════════════════ -->
+  <div id="readme-overlay" class="overlay readme-overlay hidden">
+    <div class="readme-card">
+      <div class="readme-header">
+        <h2>📖 README</h2>
+        <button id="close-readme-btn" class="btn btn-icon" title="Close (Esc)">✕</button>
+      </div>
+      <div id="readme-body" class="readme-body">
+        <p class="readme-loading">Loading…</p>
+      </div>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
