@@ -1,7 +1,8 @@
 # ─── Photo Map — Cross-Platform Build Workflow ─────────────────────────────────
 #
 # Triggered whenever you push a tag that starts with "v" (e.g. v1.0.0).
-# Builds the app on three separate machines simultaneously:
+# First runs a quality gate (lint + tests + security audit), then builds
+# the app on three separate machines simultaneously:
 #   - Windows  → Photo Map Setup.exe   (NSIS installer)
 #   - macOS    → Photo Map.dmg         (universal: Intel + Apple Silicon)
 #   - Linux    → Photo Map.AppImage    (portable) + Photo Map.deb (Debian/Ubuntu)
@@ -24,10 +25,38 @@ on:
 
 jobs:
 
+  # ── Quality gate — must pass before any build starts ─────────────────────────
+  quality:
+    name: Quality gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Security audit (high+)
+        run: npm audit --audit-level=high
+
   # ── Windows build ─────────────────────────────────────────────────────────────
   build-windows:
     name: Windows
     runs-on: windows-latest
+    needs: [quality]
 
     steps:
       - name: Check out source code
@@ -43,7 +72,7 @@ jobs:
         run: npm ci
 
       - name: Rebuild native modules for Electron
-        run: npx electron-rebuild -f -w sharp
+        run: npm run rebuild
 
       - name: Build Windows installer
         run: npx electron-builder --win
@@ -63,6 +92,7 @@ jobs:
   build-mac:
     name: macOS
     runs-on: macos-latest
+    needs: [quality]
 
     steps:
       - name: Check out source code
@@ -83,7 +113,7 @@ jobs:
         run: iconutil -c icns assets/icons/icon.iconset -o assets/icons/icon.icns
 
       - name: Rebuild native modules for Electron
-        run: npx electron-rebuild -f -w sharp
+        run: npm run rebuild
 
       - name: Build macOS DMG
         run: npx electron-builder --mac
@@ -103,6 +133,7 @@ jobs:
   build-linux:
     name: Linux
     runs-on: ubuntu-latest
+    needs: [quality]
 
     steps:
       - name: Check out source code
@@ -129,7 +160,7 @@ jobs:
         run: npm ci
 
       - name: Rebuild native modules for Electron
-        run: npx electron-rebuild -f -w sharp
+        run: npm run rebuild
 
       - name: Build Linux packages
         run: npx electron-builder --linux

@@ -39,14 +39,18 @@
  *                   or { success: false, error: "error message" }
  */
 
+'use strict';
+
 const { workerData, parentPort } = require('worker_threads');
 const fs   = require('fs');
 const path = require('path');
 
-// These are the resize settings for all thumbnails.
-// Defined once here so they never drift between the three HEIC attempts.
-const RESIZE_WIDTH  = 800;
 const JPEG_QUALITY  = 85;
+const SIDEBAR_WIDTH = 800; // max width for sidebar preview thumbnails
+
+// Formats the browser can't decode natively — the generated JPEG is the only
+// display image, so it must be full-resolution rather than a small preview.
+const FULL_RES_EXTENSIONS = new Set(['.heic', '.heif', '.dng']);
 
 const HEIC_EXTENSIONS = new Set(['.heic', '.heif']);
 
@@ -64,12 +68,12 @@ async function generateThumbnail(filePath, thumbPath) {
       if (previewBuffer && previewBuffer.length > 0) {
         const sharp = require('sharp');
         await sharp(previewBuffer)
-          .resize(RESIZE_WIDTH, null, { withoutEnlargement: true })
+          .rotate()
           .jpeg({ quality: JPEG_QUALITY })
           .toFile(thumbPath);
         return { success: true, thumbPath };
       }
-    } catch (err) {
+    } catch {
       // No embedded preview — fall through to heic-convert.
     }
 
@@ -85,11 +89,11 @@ async function generateThumbnail(filePath, thumbPath) {
       });
       const sharp = require('sharp');
       await sharp(Buffer.from(jpegBuffer))
-        .resize(RESIZE_WIDTH, null, { withoutEnlargement: true })
+        .rotate()
         .jpeg({ quality: JPEG_QUALITY })
         .toFile(thumbPath);
       return { success: true, thumbPath };
-    } catch (err) {
+    } catch {
       // heic-convert failed — fall through to sharp direct.
     }
   }
@@ -97,10 +101,11 @@ async function generateThumbnail(filePath, thumbPath) {
   // ── All other formats (and final HEIC fallback) ────────────────────────────
   try {
     const sharp = require('sharp');
-    await sharp(filePath)
-      .resize(RESIZE_WIDTH, null, { withoutEnlargement: true })
-      .jpeg({ quality: JPEG_QUALITY })
-      .toFile(thumbPath);
+    const pipeline = sharp(filePath).rotate();
+    if (!FULL_RES_EXTENSIONS.has(ext)) {
+      pipeline.resize(SIDEBAR_WIDTH, null, { withoutEnlargement: true });
+    }
+    await pipeline.jpeg({ quality: JPEG_QUALITY }).toFile(thumbPath);
     return { success: true, thumbPath };
   } catch (err) {
     return { success: false, error: err.message };

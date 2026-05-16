@@ -1,0 +1,35 @@
+{
+  "env": {
+    "node": true,
+    "browser": false,
+    "es2022": true
+  },
+  "parserOptions": {
+    "ecmaVersion": 2022,
+    "sourceType": "commonjs"
+  },
+  "rules": {
+    "no-unused-vars": ["error", { "argsIgnorePattern": "^_" }],
+    "no-undef": "error",
+    "no-console": "off",
+    "eqeqeq": ["error", "always", { "null": "ignore" }],
+    "no-var": "error",
+    "prefer-const": "error",
+    "no-throw-literal": "error",
+    "no-eval": "error",
+    "no-implied-eval": "error",
+    "no-new-func": "error"
+  },
+  "overrides": [
+    {
+      "files": ["src/renderer/renderer.js"],
+      "env": {
+        "browser": true,
+        "node": false
+      },
+      "globals": {
+        "L": "readonly"
+      }
+    }
+  ]
+}

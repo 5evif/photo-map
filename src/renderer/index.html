@@ -18,7 +18,27 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!--
+    Content Security Policy — restricts what the renderer is allowed to load.
+    - script-src 'self'          : only local JS files (no eval, no inline scripts)
+    - style-src 'self' 'unsafe-inline' : inline styles allowed (required by Leaflet)
+    - img-src 'self' https://*.maptiler.com data: blob: : local photos + map tiles
+    - connect-src https://*.maptiler.com : fetch() to MapTiler geocoding API only
+    - Everything else denied by default-src 'self'.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'self';
+    script-src  'self';
+    style-src   'self' 'unsafe-inline';
+    img-src     'self' https://*.maptiler.com data: blob:;
+    connect-src https://*.maptiler.com;
+    font-src    'self';
+    object-src  'none';
+    frame-src   'none';
+    base-uri    'self';
+  ">
   <title>Photo Map</title>
+  <link rel="stylesheet" href="../../node_modules/leaflet/dist/leaflet.css">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -34,11 +54,11 @@
 
       <div class="setup-section">
         <label for="api-key-input">
-          Google Maps API Key
-          <a href="https://console.cloud.google.com" class="help-link" id="gcloud-link">Get one here →</a>
+          MapTiler API Key
+          <a href="https://cloud.maptiler.com/account/keys/" class="help-link" id="maptiler-link">Get one here →</a>
         </label>
-        <input type="text" id="api-key-input" placeholder="AIzaSy…" autocomplete="off" spellcheck="false"/>
-        <p class="field-hint">Enable "Maps JavaScript API" in your Google Cloud project.</p>
+        <input type="text" id="api-key-input" placeholder="Your MapTiler API key" autocomplete="off" spellcheck="false"/>
+        <p class="field-hint">Create a key at cloud.maptiler.com and enable map tile access.</p>
       </div>
 
       <div class="setup-section">
@@ -52,6 +72,7 @@
 
       <div id="setup-error" class="error-banner hidden"></div>
       <button id="setup-continue-btn" class="btn btn-primary btn-large">Open Map →</button>
+      <button id="setup-readme-btn" class="btn btn-secondary btn-large">📖 README</button>
     </div>
   </div>
 
@@ -87,8 +108,9 @@
           <input type="text" id="list-search" placeholder="Search…" />
           <div class="list-filters">
             <button class="btn btn-filter active" data-filter="all">All</button>
-            <button class="btn btn-filter" data-filter="bad"  title="Show only photos flagged as bad GPS">⚠ Bad GPS</button>
-            <button class="btn btn-filter" data-filter="note" title="Show only photos with notes">📝 Has Note</button>
+            <button class="btn btn-filter" data-filter="bad"      title="Show only photos flagged as bad GPS">⚠ Bad GPS</button>
+            <button class="btn btn-filter" data-filter="note"     title="Show only photos with notes">📝 Has Note</button>
+            <button class="btn btn-filter" data-filter="override" title="Show only photos with manually set GPS coordinates">✎ GPS Set</button>
           </div>
         </div>
         <div id="photo-list-items"></div>
@@ -98,12 +120,14 @@
       <div id="map"></div>
 
       <!-- Resize handle between map and right panel -->
-      <div id="sidebar-resize-handle" title="Drag to resize"></div>
+      <div id="sidebar-resize-handle" class="hidden" title="Drag to resize"></div>
 
       <!-- Right: info sidebar -->
       <div id="info-panel" class="hidden">
         <div class="panel-header">
           <h2>Photo Details</h2>
+          <button id="prev-photo-btn" class="btn btn-icon" title="Previous photo (←)" disabled>←</button>
+          <button id="next-photo-btn" class="btn btn-icon" title="Next photo (→)"      disabled>→</button>
           <button id="close-panel-btn" class="btn btn-icon" title="Close">✕</button>
         </div>
 
@@ -136,7 +160,26 @@
           </div>
           <div class="detail-section">
             <label>Coordinates</label>
-            <span id="photo-coords" class="detail-value">—</span>
+            <div class="coords-display-row">
+              <span id="photo-coords" class="detail-value">—</span>
+              <button id="set-coords-btn"   class="btn btn-secondary btn-small" title="Set or correct GPS coordinates">✎ Set</button>
+              <button id="clear-coords-btn" class="btn btn-secondary btn-small hidden" title="Clear manual GPS override">✕ Clear</button>
+            </div>
+            <div id="coords-edit-area" class="hidden">
+              <div class="coords-input-row">
+                <input id="gps-lat-input" type="number" step="any" placeholder="Latitude"/>
+                <input id="gps-lng-input" type="number" step="any" placeholder="Longitude"/>
+              </div>
+              <p class="field-hint">Or click the map to pick a location.</p>
+              <div class="note-actions">
+                <button id="save-coords-btn"   class="btn btn-primary btn-small">Save</button>
+                <button id="cancel-coords-btn" class="btn btn-secondary btn-small">Cancel</button>
+              </div>
+              <div id="coords-error" class="error-inline hidden"></div>
+            </div>
+            <div id="coords-undo-row" class="hidden">
+              <button id="undo-coords-btn" class="btn btn-secondary btn-small">↩ Undo GPS Edit</button>
+            </div>
           </div>
 
           <!-- Notes -->
@@ -207,8 +250,8 @@
       </div>
 
       <div class="settings-section">
-        <label for="settings-api-key">Google Maps API Key</label>
-        <input type="text" id="settings-api-key" placeholder="AIzaSy…" spellcheck="false"/>
+        <label for="settings-api-key">MapTiler API Key</label>
+        <input type="text" id="settings-api-key" placeholder="Your MapTiler API key" spellcheck="false" autocomplete="off"/>
         <p class="field-hint">Changes take effect after the app reloads.</p>
       </div>
 
@@ -269,7 +312,7 @@
       <div class="about-section">
         <div class="about-divider"></div>
         <p class="about-title">Photo Map</p>
-        <p class="about-meta">Build 1.0.0 &nbsp;·&nbsp; 2026-05-09</p>
+        <p class="about-meta">Build 2.0.0 &nbsp;·&nbsp; 2026-05-16</p>
         <p class="about-credit">Built by Alex Tyler &amp; Claude</p>
       </div>
 
@@ -303,8 +346,9 @@
        AUTH ERROR BANNER
   ══════════════════════════════════════════════════════ -->
   <div id="auth-error-banner" class="auth-error-banner hidden">
-    <strong>⚠ Google Maps API key error.</strong>
-    Go to <a href="#" id="auth-error-settings-link">Settings</a> to update your key.
+    <strong id="auth-error-title">⚠ MapTiler API key error — map tiles failed to load.</strong>
+    <span id="auth-error-key-detail">Go to <a href="#" id="auth-error-settings-link">Settings</a> to update your key.</span>
+    <span id="auth-error-quota-detail" class="hidden">Free tier quota exceeded — tiles unavailable until the monthly quota resets. Visit maptiler.com to review usage or upgrade your plan.</span>
   </div>
 
   <!-- ══════════════════════════════════════════════════════
@@ -421,6 +465,7 @@
     </div>
   </div>
 
+  <script src="../../node_modules/leaflet/dist/leaflet.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

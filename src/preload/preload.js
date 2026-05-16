@@ -182,6 +182,18 @@ contextBridge.exposeInMainWorld('photoMap', {
    */
   filePathToUrl: (filePath) => {
     if (!filePath) return null;
-    return 'file://' + filePath.replace(/\\/g, '/');
-  }
+    // Normalise backslashes (Windows) and ensure three slashes so the URL is
+    // unambiguous on all platforms: file:///unix/path or file:///C:/win/path.
+    // Without this, Windows paths produce file://C:/... where Chromium
+    // interprets "C" as the authority/host, causing image loads to fail.
+    const normalized = filePath.replace(/\\/g, '/');
+    return 'file://' + (normalized.startsWith('/') ? '' : '/') + normalized;
+  },
+
+  /**
+   * Makes a HEAD request to a URL from the main process (bypasses browser CORS)
+   * and returns the HTTP status code.  Used to distinguish tile error causes.
+   * Returns: { status: number } — status 0 means network error / timeout.
+   */
+  checkTileStatus: (url) => ipcRenderer.invoke('check-tile-status', url)
 });

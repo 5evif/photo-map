@@ -54,16 +54,25 @@
  *   "scan-progress"         — Sent periodically during a scan to show live progress in the status bar.
  */
 
+'use strict';
+
+// Surface crashes in the main process rather than silently swallowing them.
+process.on('uncaughtException',   (err)    => console.error('Uncaught exception in main process:',       err));
+process.on('unhandledRejection',  (reason) => console.error('Unhandled rejection in main process:',      reason));
+
 const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron');
+// Remove the default Electron menu bar entirely.
+Menu.setApplicationMenu(null);
 const { Worker } = require('worker_threads'); // built into Node.js — runs thumbnail generation off the main thread
 const path   = require('path');
 const fs     = require('fs');
+const https  = require('https');
 const os     = require('os');     // built into Node.js — used for the machine hostname in lock files
 const crypto = require('crypto'); // built into Node.js — used to hash thumbnail filenames
 const Store  = require('electron-store');
 const chokidar = require('chokidar');
 const exifr    = require('exifr');  // reads GPS and date from photo EXIF metadata
-const sharp    = require('sharp');  // resizes images into JPEG thumbnails
+const { isPidRunning, csvEscape, SUPPORTED_EXTENSIONS } = require('../utils.js');
 
 // ─── App-wide state ────────────────────────────────────────────────────────────
 
@@ -106,17 +115,23 @@ function ensureCacheDirExists() {
 }
 
 function createWindow() {
-  const bounds = store.get('windowBounds');
+  const raw    = store.get('windowBounds');
+  const width  = Number.isInteger(raw?.width)  && raw.width  >= 400 ? raw.width  : 1280;
+  const height = Number.isInteger(raw?.height) && raw.height >= 300 ? raw.height : 860;
 
   mainWindow = new BrowserWindow({
-    width:  bounds.width,
-    height: bounds.height,
+    width,
+    height,
     minWidth:  900,
     minHeight: 600,
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload', 'preload.js'),
       nodeIntegration: false,
-      contextIsolation: true
+      contextIsolation: true,
+      // Sandboxes the renderer process so it cannot access Node.js APIs
+      // directly. The preload still works because it only uses contextBridge
+      // and ipcRenderer, both of which are available in sandboxed preloads.
+      sandbox: true
     },
     // 'hiddenInset' overlays the traffic-light buttons on the toolbar on macOS.
     // On Windows the default title bar is used instead (buttons on the right).
@@ -126,46 +141,28 @@ function createWindow() {
 
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
 
+  // Redirect any navigation away from the local app file to the system browser.
+  // Without this, clicking an <a href="https://..."> in the renderer replaces the
+  // app window with the website and there is no way back without restarting.
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!url.startsWith('file://')) {
+      event.preventDefault();
+      shell.openExternal(url);
+    }
+  });
+
+  // Also handle target="_blank" links (e.g. the map attribution anchors).
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (!url.startsWith('file://')) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+
   // Save window size whenever the user resizes it.
   mainWindow.on('resize', () => {
     const [width, height] = mainWindow.getSize();
     store.set('windowBounds', { width, height });
   });
 
-  buildAppMenu();
-}
-
-function buildAppMenu() {
-  const template = [
-    {
-      label: 'Photo Map',
-      submenu: [{ role: 'about' }, { type: 'separator' }, { role: 'quit' }]
-    },
-    {
-      label: 'Edit',
-      submenu: [
-        { role: 'undo' }, { role: 'redo' }, { type: 'separator' },
-        { role: 'cut'  }, { role: 'copy' }, { role: 'paste' }
-      ]
-    },
-    {
-      label: 'Settings',
-      submenu: [{
-        label: 'Open Settings…',
-        accelerator: 'CmdOrCtrl+,',
-        click: () => { if (mainWindow) mainWindow.webContents.send('open-settings'); }
-      }]
-    },
-    {
-      label: 'View',
-      submenu: [
-        { role: 'reload' }, { role: 'toggleDevTools' }, { type: 'separator' },
-        { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' },
-        { type: 'separator' }, { role: 'togglefullscreen' }
-      ]
-    }
-  ];
-  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
 // ─── GPS Cache ─────────────────────────────────────────────────────────────────
@@ -335,27 +332,6 @@ function acquireLock(folderPath) {
 }
 
 /*
- * Checks whether a process with the given PID is currently running on this machine.
- * Uses process.kill(pid, 0) which probes for existence without sending a real signal.
- * Returns true if the process is alive, false if it is gone or the check fails.
- *
- * Input: pid — a process ID number (from the lock file)
- * Returns: boolean
- */
-function isPidRunning(pid) {
-  if (!pid || typeof pid !== 'number') return false;
-  try {
-    // Signal 0 = existence check only, no actual signal sent.
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // ESRCH = no such process (gone); EPERM = process exists but owned by
-    // another user (still running — we just can't signal it).
-    return err.code === 'EPERM';
-  }
-}
-
-/*
  * Deletes the lock file for the given folder (or the currently locked folder
  * if no path is supplied).  Safe to call even if no lock exists.
  */
@@ -379,10 +355,6 @@ function releaseLock(folderPath) {
 }
 
 // ─── Folder Scanning ───────────────────────────────────────────────────────────
-
-const SUPPORTED_EXTENSIONS = new Set([
-  '.jpg', '.jpeg', '.heic', '.heif', '.png', '.webp', '.dng', '.avif'
-]);
 
 /*
  * Recursively collects all photo file paths from a folder.
@@ -427,7 +399,10 @@ async function extractPhotoData(filePath) {
 
     if (!data || data.latitude === undefined) {
       const gps = await exifr.gps(filePath).catch(() => null);
-      if (!gps) return null;
+      if (!gps) {
+        const date = data ? ((data.DateTimeOriginal || data.CreateDate || null)?.toISOString?.() ?? null) : null;
+        return { filePath, filename: path.basename(filePath), date, noGps: true, mtimeMs: stat.mtimeMs };
+      }
       return { lat: gps.latitude, lng: gps.longitude, date: null,
                filename: path.basename(filePath), filePath, mtimeMs: stat.mtimeMs };
     }
@@ -450,8 +425,9 @@ async function extractPhotoData(filePath) {
 async function scanFolder(folderPath, recursive) {
   const cache = loadGpsCache();
   const updatedCache = {};
-  const photos = [];
-  const errors = [];
+  const photos      = [];
+  const noGpsPhotos = [];
+  const errors      = [];
 
   const files = collectPhotoFiles(folderPath, recursive);
   const totalScanned = files.length;
@@ -468,15 +444,19 @@ async function scanFolder(folderPath, recursive) {
         if (cached && cached.mtimeMs === stat.mtimeMs) {
           updatedCache[filePath] = cached;
           if (cached.lat !== undefined) photos.push(cached);
+          else if (cached.noGps && cached.filename) noGpsPhotos.push(cached);
           return;
         }
 
         const data = await extractPhotoData(filePath);
-        if (data) {
+        if (data && !data.noGps) {
           updatedCache[filePath] = data;
           photos.push(data);
+        } else if (data && data.noGps) {
+          updatedCache[filePath] = data;
+          noGpsPhotos.push(data);
         } else {
-          updatedCache[filePath] = { filePath, mtimeMs: stat.mtimeMs, noGps: true };
+          updatedCache[filePath] = { filePath, mtimeMs: stat.mtimeMs, error: true };
         }
       } catch (err) {
         errors.push({ filePath, error: err.message });
@@ -493,7 +473,7 @@ async function scanFolder(folderPath, recursive) {
   }
 
   saveGpsCache(updatedCache);
-  return { photos, totalScanned, totalWithGps: photos.length, errors };
+  return { photos, noGpsPhotos, totalScanned, totalWithGps: photos.length, errors };
 }
 
 // ─── Thumbnail Generation (worker thread) ─────────────────────────────────────
@@ -578,16 +558,29 @@ ipcMain.handle('scan-folder', async (event, { folderPath, recursive }) => {
 
 ipcMain.handle('get-thumbnail', async (event, filePath) => getThumbnail(filePath));
 
-ipcMain.handle('rename-file', async (event, { oldPath, newName, folderPath }) => {
-  const dir     = path.dirname(oldPath);
-  const newPath = path.join(dir, newName);
+ipcMain.handle('rename-file', async (event, { oldPath, newName, folderPath: _folderPath }) => {
+  const dir = path.dirname(oldPath);
 
   if (/[\/\\:*?"<>|]/.test(newName))
     return { success: false, error: 'Filename contains illegal characters (/ \\ : * ? " < > |)' };
   if (!newName.trim())
     return { success: false, error: 'Filename cannot be empty.' };
-  if (fs.existsSync(newPath) && oldPath.toLowerCase() !== newPath.toLowerCase())
-    return { success: false, error: 'A file with that name already exists in this folder.' };
+
+  // If the target name is already taken (and it's not a case-only rename of the
+  // same file), append a Windows-style copy number: "name (2).ext", "(3)", etc.
+  const ext  = path.extname(newName);
+  const base = path.basename(newName, ext);
+  let resolvedName = newName;
+  let counter = 2;
+  while (
+    fs.existsSync(path.join(dir, resolvedName)) &&
+    oldPath.toLowerCase() !== path.join(dir, resolvedName).toLowerCase()
+  ) {
+    resolvedName = `${base} (${counter})${ext}`;
+    counter++;
+  }
+
+  const newPath = path.join(dir, resolvedName);
 
   try {
     fs.renameSync(oldPath, newPath);
@@ -595,22 +588,18 @@ ipcMain.handle('rename-file', async (event, { oldPath, newName, folderPath }) =>
     // Keep GPS cache key in sync with new path.
     const cache = loadGpsCache();
     if (cache[oldPath]) {
-      cache[newPath] = { ...cache[oldPath], filePath: newPath, filename: newName };
+      cache[newPath] = { ...cache[oldPath], filePath: newPath, filename: resolvedName };
       delete cache[oldPath];
       saveGpsCache(cache);
     }
 
-    // Keep metadata keys in sync — so notes and flags follow the renamed file.
-    if (folderPath) {
-      const meta = readMetadata(folderPath);
-      if (meta.photos[oldPath]) {
-        meta.photos[newPath] = meta.photos[oldPath];
-        delete meta.photos[oldPath];
-        writeMetadata(folderPath, meta);
-      }
-    }
+    // Metadata re-keying is handled entirely by the renderer after it receives
+    // this result — it re-keys state.meta in memory then calls saveMetadata(),
+    // which writes the full authoritative state to disk.  Doing it here would
+    // read a potentially stale disk snapshot and could silently drop fields
+    // (like gpsOverride) that the renderer holds in memory but hasn't yet flushed.
 
-    return { success: true, newPath };
+    return { success: true, newPath, newName: resolvedName };
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -618,11 +607,22 @@ ipcMain.handle('rename-file', async (event, { oldPath, newName, folderPath }) =>
 
 ipcMain.handle('show-in-folder', (event, filePath) => shell.showItemInFolder(filePath));
 
-// NOTE: export-labels and import-labels IPC handlers were removed when those
-// features were removed from the Settings UI.  The export-labels handler is no
-// longer called from anywhere in the renderer, so it has been deleted here too.
-// If you need to restore label import/export in the future, the handlers were
-// straightforward dialog.showSaveDialog / dialog.showOpenDialog wrappers.
+// Makes a HEAD request to a URL from the main process (no CORS restrictions)
+// and returns the HTTP status code.  Used by the renderer to distinguish
+// "bad API key" (401/403) from "quota exceeded" (429) tile errors.
+ipcMain.handle('check-tile-status', (event, url) => {
+  // Only allow HTTPS requests to MapTiler domains to prevent SSRF.
+  if (typeof url !== 'string' || !/^https:\/\/[a-z0-9-]+\.maptiler\.com\//i.test(url))
+    return { status: 0 };
+  return new Promise((resolve) => {
+    const req = https.request(url, { method: 'HEAD' }, (res) => {
+      resolve({ status: res.statusCode });
+    });
+    req.on('error', () => resolve({ status: 0 }));
+    req.setTimeout(8000, () => { req.destroy(); resolve({ status: 0 }); });
+    req.end();
+  });
+});
 
 ipcMain.handle('clear-thumbnail-cache', () => {
   try {
@@ -638,7 +638,12 @@ ipcMain.handle('watch-folder', (event, { folderPath, recursive }) => {
   folderWatcher = chokidar.watch(
     recursive ? path.join(folderPath, '**') : path.join(folderPath, '*'),
     {
-      ignored: [/(^|[\/\\])\./, `**/${METADATA_FILENAME}`, `**/${LOCK_FILENAME}`],
+      ignored: [
+        /(^|[\/\\])\./,                      // dotfiles
+        `**/${METADATA_FILENAME}`,
+        `**/${LOCK_FILENAME}`,
+        (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } }
+      ],
       persistent: true, ignoreInitial: true
     }
   );
@@ -789,17 +794,16 @@ ipcMain.handle('export-data', async (event, { photos, metadata, format }) => {
       output = JSON.stringify({ type: 'FeatureCollection', features }, null, 2);
 
     } else {
-      // Build a CSV. Wrap fields in double-quotes and escape any internal quotes.
-      const escape = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+      // Build a CSV.
       const header = ['filename', 'latitude', 'longitude', 'date', 'note', 'bad_gps'];
       const rows   = photos.map(p => {
         const pm = (metadata.photos || {})[p.filePath] || {};
         return [
-          escape(p.filename),
+          csvEscape(p.filename),
           p.lat,
           p.lng,
-          escape(p.date || ''),
-          escape(pm.note || ''),
+          csvEscape(p.date || ''),
+          csvEscape(pm.note || ''),
           pm.badGps ? 'true' : 'false'
         ].join(',');
       });

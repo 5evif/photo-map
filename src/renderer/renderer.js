@@ -8,10 +8,10 @@
  * Responsibilities:
  *   - Setup screen: API key + folder picker shown on every launch,
  *     pre-populated with last-used values (skipped when reloading after settings save)
- *   - Main map view: Google Maps satellite view, photo pin markers,
+ *   - Main map view: Leaflet/MapTiler satellite view, photo pin markers,
  *     freeform text labels, live folder watching
  *   - Photo list sidebar (left): searchable, filterable list of all GPS photos
- *     with ⚠ bad-GPS and 📝 note badges; filter by All / Bad GPS / Has Note
+ *     with ⚠ bad-GPS, 📝 note, and ✎ GPS-override badges; filter by All / Bad GPS / Has Note / GPS Set
  *   - Info panel (right): thumbnail with zoom lightbox, rename with one-level
  *     undo (Cmd/Ctrl+Z), notes with one-level undo, bad-GPS flag, per-photo pin color
  *   - Resizable info panel: drag handle saves width across sessions
@@ -25,7 +25,7 @@
  *
  * Data flow:
  *   On startup → show setup screen (pre-populated) → user clicks Open Map →
- *   acquire folder lock → save settings → load Google Maps → load metadata →
+ *   acquire folder lock → save settings → init Leaflet map → load metadata →
  *   scan photos (with live progress) → place markers → watch folder
  *
  * Metadata (notes, bad-GPS flags, pin colors, labels) lives in state.meta,
@@ -53,12 +53,16 @@ const state = {
   photos:   [],              // array of { lat, lng, date, filename, filePath }
 
   map:          null,
-  markers:      [],          // [{ marker, data, pinEl }]  — pinEl is the PinElement
+  satelliteLayer: null,
+  streetsLayer:   null,
+  markers:      [],          // [{ marker, data, onMap }]  — onMap: bool, marker: L.Marker or null
   labelMarkers: [],
   labelsVisible: true,
 
   activePhoto:     null,
   placingLabel:    false,
+  pickingCoords:   false,
+  lastGpsEdit:     null,
   editingLabelId:  null,
   pendingLabelLatLng: null,
 
@@ -74,7 +78,7 @@ const state = {
   // Shape: { oldPath, oldName, newPath, newName, metaSnapshot } or null.
   lastRename:      null,
 
-  // Photo list filter — 'all', 'bad', or 'note'
+  // Photo list filter — 'all', 'bad', 'note', or 'override'
   listFilter:      'all',
 
   // Note undo — stores the previous note text so Save Note can be reversed.
@@ -94,6 +98,7 @@ const el = {
   folderPathInput:document.getElementById('folder-path-input'),
   browseBtn:      document.getElementById('browse-btn'),
   setupContinueBtn:document.getElementById('setup-continue-btn'),
+  setupReadmeBtn:  document.getElementById('setup-readme-btn'),
   setupError:     document.getElementById('setup-error'),
 
   // Toolbar
@@ -112,6 +117,8 @@ const el = {
   // Info panel
   infoPanel:      document.getElementById('info-panel'),
   closePanelBtn:  document.getElementById('close-panel-btn'),
+  prevPhotoBtn:   document.getElementById('prev-photo-btn'),
+  nextPhotoBtn:   document.getElementById('next-photo-btn'),
   photoThumbnail: document.getElementById('photo-thumbnail'),
   thumbnailLoading:document.getElementById('thumbnail-loading'),
   zoomBtn:        document.getElementById('zoom-btn'),
@@ -122,6 +129,15 @@ const el = {
   renameSuccess:  document.getElementById('rename-success'),
   photoDate:      document.getElementById('photo-date'),
   photoCoords:    document.getElementById('photo-coords'),
+  setCoordsBtn:   document.getElementById('set-coords-btn'),
+  coordsEditArea: document.getElementById('coords-edit-area'),
+  gpsLatInput:    document.getElementById('gps-lat-input'),
+  gpsLngInput:    document.getElementById('gps-lng-input'),
+  saveCoordsBtn:  document.getElementById('save-coords-btn'),
+  cancelCoordsBtn:document.getElementById('cancel-coords-btn'),
+  coordsError:    document.getElementById('coords-error'),
+  undoCoordsBtn:  document.getElementById('undo-coords-btn'),
+  clearCoordsBtn: document.getElementById('clear-coords-btn'),
   photoNotes:     document.getElementById('photo-notes'),
   saveNoteBtn:    document.getElementById('save-note-btn'),
   noteSavedMsg:   document.getElementById('note-saved-msg'),
@@ -172,6 +188,9 @@ const el = {
 
   // Auth error
   authErrorBanner:        document.getElementById('auth-error-banner'),
+  authErrorTitle:         document.getElementById('auth-error-title'),
+  authErrorKeyDetail:     document.getElementById('auth-error-key-detail'),
+  authErrorQuotaDetail:   document.getElementById('auth-error-quota-detail'),
   authErrorSettingsLink:  document.getElementById('auth-error-settings-link'),
 
   // Lock error overlay
@@ -183,7 +202,11 @@ const el = {
   lockSettingsBtn: document.getElementById('lock-settings-btn'),
 
   // Status
-  statusText: document.getElementById('status-text')
+  statusText: document.getElementById('status-text'),
+
+  // Map and body — used by label placement and popup positioning
+  mapDiv:     document.getElementById('map'),
+  appBody:    document.getElementById('app-body')
 };
 
 // ─── Initialization ─────────────────────────────────────────────────────────────
@@ -237,7 +260,7 @@ async function init() {
       if (!lockResult.success) { showLockError(lockResult, state.folderPath); return; }
       showScreen('app');
       setFolderName(state.folderPath);
-      loadGoogleMaps(state.apiKey);
+      launchMap();
       return;
     }
   }
@@ -274,12 +297,13 @@ function bindSetupEvents() {
     if (folder) el.folderPathInput.value = folder;
   });
   el.setupContinueBtn.addEventListener('click', handleSetupContinue);
+  el.setupReadmeBtn.addEventListener('click', openReadme);
 }
 
 async function handleSetupContinue() {
   const apiKey     = el.apiKeyInput.value.trim();
   const folderPath = el.folderPathInput.value.trim();
-  if (!apiKey)     { showSetupError('Please enter your Google Maps API key.'); return; }
+  if (!apiKey)     { showSetupError('Please enter your MapTiler API key.'); return; }
   if (!folderPath) { showSetupError('Please select your photo folder.');       return; }
 
   hideSetupError();
@@ -296,50 +320,210 @@ async function handleSetupContinue() {
   state.apiKey = apiKey; state.folderPath = folderPath;
   showScreen('app');
   setFolderName(folderPath);
-  loadGoogleMaps(apiKey);
+  launchMap();
 }
 
 function showSetupError(msg) { el.setupError.textContent = msg; el.setupError.classList.remove('hidden'); }
 function hideSetupError()    { el.setupError.classList.add('hidden'); }
 
-// ─── Google Maps ───────────────────────────────────────────────────────────────
+// ─── Leaflet / MapTiler ────────────────────────────────────────────────────────
 
-function loadGoogleMaps(apiKey) {
-  window.initMap = initMap;
-  const script = document.createElement('script');
-  script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&callback=initMap&libraries=marker&v=beta`;
-  script.async = true; script.defer = true;
-  script.onerror = showAuthError;
-  document.head.appendChild(script);
-  window.addEventListener('gm-authfailure', showAuthError);
-}
+// Formats the browser (Chromium) can decode and display directly.
+// HEIC, DNG, HEIF are not natively supported — fall back to the generated thumbnail.
+const BROWSER_IMAGE_FORMATS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.avif']);
 
-function showAuthError() {
+const LABEL_FONT_SIZES = { small: '12px', medium: '16px', large: '22px' };
+
+const MAPTILER_ATTRIBUTION =
+  '© <a href="https://www.maptiler.com/copyright/" target="_blank">MapTiler</a> ' +
+  '© <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap contributors</a> ' +
+  '| <a href="https://leafletjs.com" target="_blank">Leaflet</a>';
+
+function showAuthError(status = 0) {
+  const quotaExceeded = status === 429;
+  el.authErrorTitle.textContent = quotaExceeded
+    ? '⚠ MapTiler request limit reached — free tier quota exceeded.'
+    : '⚠ MapTiler API key error — map tiles failed to load.';
+  el.authErrorKeyDetail.classList.toggle('hidden', quotaExceeded);
+  el.authErrorQuotaDetail.classList.toggle('hidden', !quotaExceeded);
   el.authErrorBanner.classList.remove('hidden');
 }
 
 async function initMap() {
-  state.map = new google.maps.Map(document.getElementById('map'), {
-    center: { lat: 20, lng: 0 },
-    zoom: 2,
-    mapTypeId: 'satellite',
-    mapTypeControl: true,
-    mapTypeControlOptions: {
-      style: google.maps.MapTypeControlStyle.HORIZONTAL_BAR,
-      position: google.maps.ControlPosition.TOP_RIGHT
-    },
-    mapId: 'photo-map-main'
+  // Prevent double-init if called again (e.g. from retry path).
+  if (state.map) return;
+
+  state.map = L.map('map', {
+    center:    [20, 0],
+    zoom:      2,
+    zoomControl: false
   });
 
-  state.map.addListener('click', (e) => {
-    if (state.placingLabel) showLabelPopupAtLatLng(e.latLng);
+  state.satelliteLayer = L.tileLayer(
+    `https://api.maptiler.com/maps/satellite/{z}/{x}/{y}.jpg?key=${state.apiKey}`,
+    {
+      tileSize:    512,
+      zoomOffset:  -1,
+      maxZoom:     20,
+      attribution: MAPTILER_ATTRIBUTION,
+      crossOrigin: true
+    }
+  );
+
+  state.streetsLayer = L.tileLayer(
+    `https://api.maptiler.com/maps/openstreetmap/{z}/{x}/{y}.png?key=${state.apiKey}`,
+    {
+      maxZoom:     19,
+      attribution: MAPTILER_ATTRIBUTION,
+      crossOrigin: true
+    }
+  );
+
+  state.satelliteLayer.addTo(state.map);
+
+  L.control.layers(
+    { 'Satellite': state.satelliteLayer, 'OpenStreetMap': state.streetsLayer },
+    null,
+    { position: 'topright' }
+  ).addTo(state.map);
+
+  L.control.zoom({ position: 'topright' }).addTo(state.map);
+
+  // Detect tile failures and show the appropriate banner.
+  // We probe the failed tile URL from the main process (no CORS) to get
+  // the real HTTP status — 429 means quota exceeded, 401/403 means bad key.
+  let authErrorShown = false;
+  [state.satelliteLayer, state.streetsLayer].forEach(layer => {
+    layer.on('tileerror', (e) => {
+      if (authErrorShown) return;
+      authErrorShown = true;
+      const src = e.tile?.src;
+      if (src) {
+        window.photoMap.checkTileStatus(src).then(({ status }) => showAuthError(status));
+      } else {
+        showAuthError();
+      }
+    });
   });
+
+  state.map.on('click', (e) => {
+    if (state.placingLabel) { showLabelPopupAtLatLng(e.latlng); return; }
+    if (state.pickingCoords) {
+      el.gpsLatInput.value = e.latlng.lat.toFixed(6);
+      el.gpsLngInput.value = e.latlng.lng.toFixed(6);
+    }
+  });
+
+  addAddressSearch();
 
   // Load metadata from the photo folder before rendering anything.
   await loadMetadata();
   renderAllLabels();
   await scanAndDisplay();
   watchFolder();
+}
+
+function addAddressSearch() {
+  const AddressSearch = L.Control.extend({
+    options: { position: 'topleft' },
+    onAdd() {
+      const container = L.DomUtil.create('div', 'address-search');
+      L.DomEvent.disableClickPropagation(container);
+      L.DomEvent.disableScrollPropagation(container);
+
+      const row = L.DomUtil.create('div', 'address-search-row', container);
+      const input = L.DomUtil.create('input', 'address-search-input', row);
+      input.type = 'text';
+      input.placeholder = 'Search address…';
+      input.setAttribute('aria-label', 'Search for an address');
+
+      const btn = L.DomUtil.create('button', 'btn address-search-btn', row);
+      btn.title = 'Search';
+      btn.textContent = '⌕';
+
+      const dropdown = L.DomUtil.create('div', 'address-results hidden', container);
+
+      let searchMarker = null;
+
+      function clearMarker() {
+        if (searchMarker) { searchMarker.remove(); searchMarker = null; }
+      }
+
+      function closeDropdown() {
+        dropdown.classList.add('hidden');
+        dropdown.innerHTML = '';
+      }
+
+      function showResult(feature) {
+        closeDropdown();
+        const [lng, lat] = feature.center;
+        clearMarker();
+        const icon = L.divIcon({
+          className: '',
+          html: '<div class="search-result-pin"></div>',
+          iconSize:   [14, 14],
+          iconAnchor: [7, 7]
+        });
+        searchMarker = L.marker([lat, lng], { icon, zIndexOffset: 1000 }).addTo(state.map);
+        state.map.setView([lat, lng], 13);
+        input.value = feature.place_name;
+      }
+
+      async function doSearch() {
+        const query = input.value.trim();
+        if (!query) return;
+        closeDropdown();
+        btn.disabled = true;
+        try {
+          const url = `https://api.maptiler.com/geocoding/${encodeURIComponent(query)}.json?key=${state.apiKey}&limit=5`;
+          const res  = await fetch(url);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data     = await res.json();
+          const features = data.features || [];
+          if (!features.length) {
+            const item = L.DomUtil.create('div', 'address-result-item address-result-empty', dropdown);
+            item.textContent = 'No results found.';
+            dropdown.classList.remove('hidden');
+            return;
+          }
+          features.forEach(feature => {
+            const item = L.DomUtil.create('div', 'address-result-item', dropdown);
+            item.textContent = feature.place_name;
+            item.addEventListener('click', () => showResult(feature));
+          });
+          dropdown.classList.remove('hidden');
+        } catch (err) {
+          console.error('Address search failed:', err);
+          const item = L.DomUtil.create('div', 'address-result-item address-result-empty', dropdown);
+          item.textContent = 'Search failed. Check your connection.';
+          dropdown.classList.remove('hidden');
+        } finally {
+          btn.disabled = false;
+        }
+      }
+
+      btn.addEventListener('click', doSearch);
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter')  { e.preventDefault(); doSearch(); }
+        if (e.key === 'Escape') closeDropdown();
+      });
+
+      document.addEventListener('click', (e) => {
+        if (!container.contains(e.target)) closeDropdown();
+      });
+
+      return container;
+    }
+  });
+
+  new AddressSearch().addTo(state.map);
+}
+
+function launchMap() {
+  initMap().catch(err => {
+    console.error('Map init failed:', err);
+    setStatus('⚠ Map failed to load: ' + err.message);
+  });
 }
 
 // ─── Metadata file (photo-map-data.json) ───────────────────────────────────────
@@ -381,7 +565,7 @@ async function saveMetadata() {
  */
 function getPhotoMeta(filePath) {
   if (!state.meta.photos[filePath]) {
-    state.meta.photos[filePath] = { note: '', badGps: false, pinColor: null };
+    state.meta.photos[filePath] = { note: '', badGps: false, pinColor: null, gpsOverride: null };
   }
   return state.meta.photos[filePath];
 }
@@ -399,7 +583,15 @@ async function scanAndDisplay() {
   if (result.error) { setStatus(`⚠ ${result.error}`); return; }
 
   state.photos = result.photos;
-  placePhotoMarkers(result.photos);
+  await mergeNoGpsPhotos(result.noGpsPhotos);
+  placePhotoMarkers(state.photos);
+  // Rebuild clears all marker highlights. Restore the active pin if the photo
+  // still exists; close the panel if it was removed from disk since last scan.
+  if (state.activePhoto) {
+    const stillExists = state.photos.some(p => p.filePath === state.activePhoto.filePath);
+    if (stillExists) setMarkerHighlight(state.activePhoto.filePath, true);
+    else closeInfoPanel();
+  }
   fitMapToMarkers();
   renderPhotoList();
 
@@ -408,12 +600,61 @@ async function scanAndDisplay() {
 }
 
 /*
- * Creates map markers for every photo in the array.
- * Uses the global pin color unless the photo has its own color override.
- * Bad-GPS photos get a warning-styled pin.
+ * Appends no-GPS photos to state.photos.
+ * On first encounter (no existing metadata entry) auto-sets badGps and a note.
  */
+async function mergeNoGpsPhotos(noGpsPhotos) {
+  if (!noGpsPhotos?.length) return;
+  let dirty = false;
+  for (const p of noGpsPhotos) {
+    if (!state.meta.photos[p.filePath]) {
+      const pm  = getPhotoMeta(p.filePath);
+      pm.badGps = true;
+      pm.note   = 'No GPS data found in this photo\'s EXIF metadata.';
+      dirty = true;
+    }
+    state.photos.push({ ...p, lat: null, lng: null });
+  }
+  if (dirty) await saveMetadata();
+}
+
 function placePhotoMarkers(photos) {
-  for (const p of photos) createPhotoMarker(p);
+  for (const p of photos) {
+    createPhotoMarker(p);
+  }
+}
+
+/*
+ * Moves an existing map marker to new coordinates, or creates one from scratch
+ * if the entry never had a marker (e.g. was initially flagged as bad GPS).
+ * Shared by handleSaveCoords, handleUndoCoords, handleClearCoordsOverride,
+ * and refreshMarkerPin so the create-or-update logic lives in one place.
+ */
+function placeOrMoveMarker(entry, lat, lng) {
+  const color = resolveColor(entry.data.filePath);
+  if (entry.marker) {
+    entry.marker.setLatLng([lat, lng]);
+    entry.marker.setIcon(createPinIcon(color));
+    if (!entry.onMap) { entry.marker.addTo(state.map); entry.onMap = true; }
+  } else {
+    const marker = L.marker([lat, lng], { icon: createPinIcon(color), title: entry.data.filename });
+    marker.on('click', () => openInfoPanel(entry.data));
+    marker.addTo(state.map);
+    entry.marker = marker;
+    entry.onMap  = true;
+  }
+}
+
+/*
+ * Returns the URL to display for a photo.
+ * Browser-decodable formats (JPEG, PNG, WebP, AVIF) are served directly from
+ * disk; everything else (HEIC, DNG, etc.) goes through the thumbnail generator.
+ */
+async function resolvePhotoDisplayUrl(filePath, filename) {
+  const ext = getExtension(filename).toLowerCase();
+  if (BROWSER_IMAGE_FORMATS.has(ext)) return window.photoMap.filePathToUrl(filePath);
+  const thumbPath = await window.photoMap.getThumbnail(filePath);
+  return thumbPath ? window.photoMap.filePathToUrl(thumbPath) : null;
 }
 
 /*
@@ -421,51 +662,63 @@ function placePhotoMarkers(photos) {
  * Per-photo color → global meta color → app settings color → hardcoded default.
  */
 function resolveColor(filePath) {
-  const pm = state.meta.photos[filePath];
-  return (pm && pm.pinColor) || state.meta.pinColor || state.pinColor || '#4f8ef7';
+  const pm  = state.meta.photos[filePath];
+  const raw = (pm && pm.pinColor) || state.meta.pinColor || state.pinColor || '#4f8ef7';
+  return sanitizeColor(raw);
+}
+
+/*
+ * Returns a Leaflet DivIcon for a photo pin with the given color.
+ * The icon consists of a colored circle with a 📷 glyph and a downward tip.
+ * iconAnchor is at the bottom of the tip so the pin points to the exact location.
+ */
+function createPinIcon(color) {
+  return L.divIcon({
+    className: '',
+    html: `<div class="photo-pin-wrapper">
+             <div class="photo-pin-circle" style="background:${color}">📷</div>
+             <div class="photo-pin-tip" style="border-top-color:${color}"></div>
+           </div>`,
+    iconSize:   [34, 44],
+    iconAnchor: [17, 44],  // bottom-center of the tip
+    popupAnchor:[0, -44]
+  });
 }
 
 /*
  * Creates a single map marker for a photo.
- * Photos flagged as bad GPS are skipped — they are not shown on the map at all.
- * The entry is still pushed to state.markers (with marker.map = null) so the
- * info panel and photo list can still reach the photo's data; it just won't
- * appear as a pin on the map.
+ * Photos flagged as bad GPS, or with no coordinates and no override, are stored
+ * as null-marker entries so the info panel and photo list can still reach their
+ * data; they just have no visible pin.
  */
 function createPhotoMarker(photoData) {
   const pm    = getPhotoMeta(photoData.filePath);
   const isBad = pm.badGps === true;
 
-  // Don't place a visible pin for photos with flagged GPS.
   if (isBad) {
-    // Store a null-map entry so the photo is still reachable via the list.
-    state.markers.push({ marker: { map: null, title: photoData.filename }, data: photoData, pinEl: null });
+    state.markers.push({ marker: null, data: photoData, onMap: false });
     return;
   }
 
-  const pin = new google.maps.marker.PinElement({
-    background:  resolveColor(photoData.filePath),
-    borderColor: '#ffffff',
-    glyphColor:  '#ffffff',
-    glyph:       '📷'
-  });
-
-  const marker = new google.maps.marker.AdvancedMarkerElement({
-    map:      state.map,
-    position: { lat: photoData.lat, lng: photoData.lng },
-    title:    photoData.filename,
-    content:  pin.element
-  });
-
-  marker.addListener('click', () => openInfoPanel(photoData));
-  state.markers.push({ marker, data: photoData, pinEl: pin });
+  const effLat = pm.gpsOverride ? pm.gpsOverride.lat : photoData.lat;
+  const effLng = pm.gpsOverride ? pm.gpsOverride.lng : photoData.lng;
+  if (effLat == null || effLng == null) {
+    state.markers.push({ marker: null, data: photoData, onMap: false });
+    return;
+  }
+  const marker = L.marker(
+    [effLat, effLng],
+    { icon: createPinIcon(resolveColor(photoData.filePath)), title: photoData.filename }
+  );
+  marker.on('click', () => openInfoPanel(photoData));
+  marker.addTo(state.map);
+  state.markers.push({ marker, data: photoData, onMap: true });
 }
 
 /*
  * Responds to a change in pin color or bad-GPS flag for a single photo.
- * If the photo is now flagged as bad GPS, removes it from the map.
- * If the flag is cleared, adds it back as a normal pin.
- * If the color changed, rebuilds the pin element with the new color.
+ * If now flagged bad GPS, removes pin from map.
+ * If un-flagged or color changed, adds/updates the pin.
  */
 function refreshMarkerPin(filePath) {
   const entry = state.markers.find(m => m.data.filePath === filePath);
@@ -475,38 +728,13 @@ function refreshMarkerPin(filePath) {
   const isBad = pm.badGps === true;
 
   if (isBad) {
-    // Remove from map if it's currently showing.
-    if (entry.marker && typeof entry.marker.map !== 'undefined') {
-      entry.marker.map = null;
-    }
-    entry.pinEl = null;
+    if (entry.marker && entry.onMap) { entry.marker.remove(); entry.onMap = false; }
   } else {
-    // Photo was either just un-flagged, or had its color changed.
-    // If it already has an AdvancedMarkerElement, update its color and re-add to map.
-    if (entry.pinEl) {
-      // Existing real marker — just rebuild the pin element with the new color.
-      const newPin = new google.maps.marker.PinElement({
-        background: resolveColor(filePath), borderColor: '#ffffff',
-        glyphColor: '#ffffff', glyph: '📷'
-      });
-      entry.marker.content = newPin.element;
-      entry.pinEl = newPin;
-      entry.marker.map = state.map;
-    } else {
-      // Was previously a null/bad-GPS entry — create a real marker now.
-      const pin = new google.maps.marker.PinElement({
-        background: resolveColor(filePath), borderColor: '#ffffff',
-        glyphColor: '#ffffff', glyph: '📷'
-      });
-      const marker = new google.maps.marker.AdvancedMarkerElement({
-        map:      state.map,
-        position: { lat: entry.data.lat, lng: entry.data.lng },
-        title:    entry.data.filename,
-        content:  pin.element
-      });
-      marker.addListener('click', () => openInfoPanel(entry.data));
-      entry.marker = marker;
-      entry.pinEl  = pin;
+    const effLat = pm.gpsOverride ? pm.gpsOverride.lat : entry.data.lat;
+    const effLng = pm.gpsOverride ? pm.gpsOverride.lng : entry.data.lng;
+    if (effLat != null && effLng != null) {
+      placeOrMoveMarker(entry, effLat, effLng);
+      if (state.activePhoto?.filePath === filePath) setMarkerHighlight(filePath, true);
     }
   }
 
@@ -514,22 +742,22 @@ function refreshMarkerPin(filePath) {
 }
 
 function clearPhotoMarkers() {
-  for (const { marker } of state.markers) marker.map = null;
+  for (const { marker, onMap } of state.markers) {
+    if (marker && onMap) marker.remove();
+  }
   state.markers = [];
 }
 
 /*
  * Adjusts the map zoom and centre so all visible photo markers fit on screen.
- * Bad-GPS entries are excluded — they have no pin on the map, so including
- * their coordinates would zoom to a position with nothing to see there.
+ * Bad-GPS entries (onMap: false) are excluded.
  */
 function fitMapToMarkers() {
-  // Only consider markers that are actually visible on the map (pinEl != null).
-  const visible = state.markers.filter(m => m.pinEl !== null);
-  if (!visible.length) return;
-  const bounds = new google.maps.LatLngBounds();
-  for (const { data } of visible) bounds.extend({ lat: data.lat, lng: data.lng });
-  state.map.fitBounds(bounds);
+  const points = [];
+  state.markers.filter(m => m.onMap && m.marker).forEach(m => points.push(m.marker.getLatLng()));
+  state.labelMarkers.forEach(lm => points.push([lm.labelData.lat, lm.labelData.lng]));
+  if (!points.length) return;
+  state.map.fitBounds(L.latLngBounds(points), { padding: [30, 30] });
 }
 
 // ─── Photo List (left sidebar) ─────────────────────────────────────────────────
@@ -545,35 +773,52 @@ function fitMapToMarkers() {
  */
 function setMarkerHighlight(filePath, highlight) {
   const entry = state.markers.find(m => m.data.filePath === filePath);
-  if (!entry || !entry.pinEl) return; // bad-GPS entries have no visible pin
-  entry.pinEl.element.classList.toggle('pin-selected', highlight);
+  if (!entry || !entry.onMap || !entry.marker) return;
+  // setZIndexOffset brings the pin above its neighbours so the scaled-up
+  // selected pin is never hidden behind an adjacent one.
+  entry.marker.setZIndexOffset(highlight ? 1000 : 0);
+  const markerEl = entry.marker.getElement();
+  if (markerEl) markerEl.querySelector('.photo-pin-wrapper')?.classList.toggle('pin-selected', highlight);
+}
+
+/*
+ * Returns the sorted, filtered photo array matching the current search query
+ * and active filter button.  Used by renderPhotoList and navigatePhoto so the
+ * filter logic lives in one place.
+ */
+function getFilteredPhotos() {
+  const query = (el.listSearch.value || '').toLowerCase();
+  return [...state.photos]
+    .sort((a, b) => a.filename.localeCompare(b.filename, undefined, { sensitivity: 'base' }))
+    .filter(photo => {
+      if (query && !photo.filename.toLowerCase().includes(query)) return false;
+      const pm = getPhotoMeta(photo.filePath);
+      if (state.listFilter === 'bad'      && !pm.badGps)        return false;
+      if (state.listFilter === 'note'     && !pm.note?.trim())   return false;
+      if (state.listFilter === 'override' && !pm.gpsOverride)    return false;
+      return true;
+    });
 }
 
 /*
  * Renders the scrollable list of photos in the left sidebar.
- * Applies the current text search and category filter (All/Bad GPS/Has Note)
+ * Applies the current text search and category filter (All / Bad GPS / Has Note / GPS Set)
  * so only matching photos are shown. Clicking a row pans to that photo and
  * opens the info panel.
  */
 function renderPhotoList() {
-  const query = (el.listSearch.value || '').toLowerCase();
-  const sorted = [...state.photos].sort((a, b) =>
-    a.filename.localeCompare(b.filename, undefined, { sensitivity: 'base' })
-  );
+  const filtered = getFilteredPhotos();
 
   el.photoListItems.innerHTML = '';
+  const visiblePaths = new Set();
 
-  for (const photo of sorted) {
-    if (query && !photo.filename.toLowerCase().includes(query)) continue;
+  for (const photo of filtered) {
+    visiblePaths.add(photo.filePath);
 
-    // Apply the active filter button (All / Bad GPS / Has Note).
-    // getPhotoMeta is called once and reused for both filtering and badge rendering.
-    const pm    = getPhotoMeta(photo.filePath);
-    if (state.listFilter === 'bad'  && !pm.badGps)          continue;
-    if (state.listFilter === 'note' && !(pm.note?.trim()))   continue;
-
-    const isBad   = pm.badGps === true;
-    const hasNote = pm.note && pm.note.trim().length > 0;
+    const pm          = getPhotoMeta(photo.filePath);
+    const isBad       = pm.badGps === true;
+    const hasNote     = !!(pm.note && pm.note.trim().length > 0);
+    const hasOverride = !!pm.gpsOverride;
 
     const row = document.createElement('div');
     row.className = 'list-row' + (state.activePhoto?.filePath === photo.filePath ? ' active' : '');
@@ -581,20 +826,22 @@ function renderPhotoList() {
 
     row.innerHTML = `
       <div class="list-row-name">
-        ${isBad ? '<span class="badge badge-warn" title="GPS flagged as incorrect">⚠</span>' : ''}
-        ${hasNote ? '<span class="badge badge-note" title="Has a note">📝</span>' : ''}
+        ${isBad       ? '<span class="badge badge-warn"     title="GPS flagged as incorrect">⚠</span>' : ''}
+        ${hasNote     ? '<span class="badge badge-note"     title="Has a note">📝</span>' : ''}
+        ${hasOverride ? '<span class="badge badge-override" title="GPS coordinates manually set">✎</span>' : ''}
         <span class="list-filename">${escapeHtml(photo.filename)}</span>
       </div>
       <div class="list-row-date">${photo.date ? formatDateShort(photo.date) : '—'}</div>
     `;
 
     row.addEventListener('click', () => {
-      // Pan to the marker and open the info panel.
-      state.map.panTo({ lat: photo.lat, lng: photo.lng });
-      state.map.setZoom(Math.max(state.map.getZoom(), 14));
+      const pm = getPhotoMeta(photo.filePath);
+      const effLat = pm.gpsOverride ? pm.gpsOverride.lat : photo.lat;
+      const effLng = pm.gpsOverride ? pm.gpsOverride.lng : photo.lng;
+      if (effLat != null && effLng != null) {
+        state.map.setView([effLat, effLng], Math.max(state.map.getZoom(), 14));
+      }
       openInfoPanel(photo);
-
-      // Highlight this row.
       document.querySelectorAll('.list-row.active').forEach(r => r.classList.remove('active'));
       row.classList.add('active');
     });
@@ -604,6 +851,25 @@ function renderPhotoList() {
 
   if (!el.photoListItems.children.length) {
     el.photoListItems.innerHTML = '<p class="list-empty">No photos match your search.</p>';
+  }
+
+  applyMarkerFilter(visiblePaths);
+  updateNavButtons();
+}
+
+/*
+ * Shows only the markers whose filePaths are in visiblePaths.
+ * Does not modify entry.onMap — that flag reflects GPS/badGps state,
+ * not filter state — so clearing the filter restores markers correctly.
+ */
+function applyMarkerFilter(visiblePaths) {
+  if (!state.map) return;
+  for (const entry of state.markers) {
+    if (!entry.marker) continue;
+    const shouldShow = entry.onMap && visiblePaths.has(entry.data.filePath);
+    const isOnMap    = state.map.hasLayer(entry.marker);
+    if (shouldShow && !isOnMap)  entry.marker.addTo(state.map);
+    if (!shouldShow && isOnMap)  entry.marker.remove();
   }
 }
 
@@ -621,19 +887,23 @@ async function handleFolderChange({ type, filePath }) {
     } else {
       clearPhotoMarkers();
       state.photos = result.photos;
-      placePhotoMarkers(result.photos);
+      await mergeNoGpsPhotos(result.noGpsPhotos);
+      placePhotoMarkers(state.photos);
+      // Rebuild markers clears the highlight — restore it if a photo is still open.
+      if (state.activePhoto) setMarkerHighlight(state.activePhoto.filePath, true);
       renderPhotoList();
       setStatus(`${result.totalScanned} photos · ${result.totalWithGps} with GPS`);
     }
   } else if (type === 'remove') {
     const idx = state.markers.findIndex(m => m.data.filePath === filePath);
     if (idx !== -1) {
-      state.markers[idx].marker.map = null;
+      const { marker, onMap } = state.markers[idx];
+      if (marker && onMap) marker.remove();
       state.markers.splice(idx, 1);
       state.photos = state.photos.filter(p => p.filePath !== filePath);
       renderPhotoList();
       if (state.activePhoto?.filePath === filePath) closeInfoPanel();
-      setStatus(`${state.photos.length} photos with GPS`);
+      setStatus(`${state.photos.filter(p => p.lat != null).length} photos with GPS`);
     }
   }
 }
@@ -666,13 +936,16 @@ async function openInfoPanel(photoData) {
   setMarkerHighlight(photoData.filePath, true);
   const pm = getPhotoMeta(photoData.filePath);
 
-  const ext          = getExtension(photoData.filename);
-  const nameWithout  = photoData.filename.slice(0, -ext.length);
+  const ext         = getExtension(photoData.filename);
+  const nameWithout = photoData.filename.slice(0, -ext.length);
 
   el.renameInput.value    = nameWithout;
   el.renameExt.textContent = ext;
   el.photoDate.textContent = photoData.date ? formatDate(photoData.date) : 'Not available';
-  el.photoCoords.textContent = `${photoData.lat.toFixed(6)}, ${photoData.lng.toFixed(6)}`;
+  const effLat = pm.gpsOverride ? pm.gpsOverride.lat : photoData.lat;
+  const effLng = pm.gpsOverride ? pm.gpsOverride.lng : photoData.lng;
+  el.photoCoords.textContent = (effLat != null && effLng != null)
+    ? `${effLat.toFixed(6)}, ${effLng.toFixed(6)}` : 'None';
 
   // Load saved note and flags.
   el.photoNotes.value        = pm.note    || '';
@@ -682,36 +955,222 @@ async function openInfoPanel(photoData) {
   hideRenameMessages();
   el.noteSavedMsg.classList.add('hidden');
 
-  // Clear both undo states when switching to a new photo — undo only makes
-  // sense for the photo currently displayed, not a previously opened one.
+  // Clear all undo states when switching to a new photo.
   state.lastRename = null;
   el.undoRenameBtn.classList.add('hidden');
   state.lastNote = null;
   el.undoNoteBtn.classList.add('hidden');
+  state.lastGpsEdit = null;
+  el.undoCoordsBtn.classList.add('hidden');
+  el.clearCoordsBtn.classList.toggle('hidden', !pm.gpsOverride);
+  exitCoordsEditMode();
 
   el.infoPanel.classList.remove('hidden');
+  el.resizeHandle.classList.remove('hidden');
+  state.map?.invalidateSize();
   el.zoomBtn.classList.add('hidden');
 
-  // Load thumbnail asynchronously.
   el.photoThumbnail.style.display = 'none';
   el.thumbnailLoading.style.display = 'flex';
 
-  const thumbPath = await window.photoMap.getThumbnail(photoData.filePath);
-  if (thumbPath) {
-    const url = window.photoMap.filePathToUrl(thumbPath);
-    el.photoThumbnail.src = url;
+  // Capture the path before the await so we can detect if the user opened a
+  // different photo while the thumbnail was still loading (e.g. a slow HEIC
+  // decode). If the active photo changed, discard this result silently —
+  // the newer openInfoPanel call is responsible for updating the UI.
+  const expectedPath = photoData.filePath;
+  const displayUrl = await resolvePhotoDisplayUrl(photoData.filePath, photoData.filename);
+  if (state.activePhoto?.filePath !== expectedPath) return;
+
+  if (displayUrl) {
+    el.photoThumbnail.src = displayUrl;
+    el.photoThumbnail.dataset.url = displayUrl;
     el.photoThumbnail.style.display = 'block';
     el.zoomBtn.classList.remove('hidden');
-    // Store thumbnail URL for the lightbox.
-    el.photoThumbnail.dataset.url = url;
   }
   el.thumbnailLoading.style.display = 'none';
+  updateNavButtons();
 }
 
 function closeInfoPanel() {
   if (state.activePhoto) setMarkerHighlight(state.activePhoto.filePath, false);
+  exitCoordsEditMode();
   el.infoPanel.classList.add('hidden');
+  el.resizeHandle.classList.add('hidden');
   state.activePhoto = null;
+  state.map?.invalidateSize();
+  updateNavButtons();
+}
+
+/*
+ * Enables or disables the ← / → nav buttons based on where the active photo
+ * sits in the current filtered list.  Called whenever the panel opens, closes,
+ * or the filter/search changes.
+ */
+function updateNavButtons() {
+  if (!state.activePhoto) {
+    el.prevPhotoBtn.disabled = true;
+    el.nextPhotoBtn.disabled = true;
+    return;
+  }
+  const list = getFilteredPhotos();
+  const idx  = list.findIndex(p => p.filePath === state.activePhoto.filePath);
+  el.prevPhotoBtn.disabled = idx <= 0;
+  el.nextPhotoBtn.disabled = idx === -1 || idx >= list.length - 1;
+}
+
+/*
+ * Moves to the previous (dir = -1) or next (dir = 1) photo in the current
+ * filtered list, pans the map to it, and scrolls its list row into view.
+ */
+function navigatePhoto(dir) {
+  if (!state.activePhoto) return;
+  const list = getFilteredPhotos();
+  const idx  = list.findIndex(p => p.filePath === state.activePhoto.filePath);
+  if (idx === -1) return;
+  const next = list[idx + dir];
+  if (!next) return;
+
+  const pm     = getPhotoMeta(next.filePath);
+  const effLat = pm.gpsOverride ? pm.gpsOverride.lat : next.lat;
+  const effLng = pm.gpsOverride ? pm.gpsOverride.lng : next.lng;
+  if (effLat != null && effLng != null) {
+    state.map.setView([effLat, effLng], Math.max(state.map.getZoom(), 14));
+  }
+
+  openInfoPanel(next);
+
+  // Sync the active highlight in the list without a full re-render.
+  document.querySelectorAll('.list-row.active').forEach(r => r.classList.remove('active'));
+  const row = document.querySelector(`.list-row[data-filepath="${CSS.escape(next.filePath)}"]`);
+  if (row) { row.classList.add('active'); row.scrollIntoView({ block: 'nearest' }); }
+}
+
+// ─── GPS Edit ─────────────────────────────────────────────────────────────────
+
+function enterCoordsEditMode() {
+  if (!state.activePhoto) return;
+  const pm  = getPhotoMeta(state.activePhoto.filePath);
+  const lat = pm.gpsOverride ? pm.gpsOverride.lat : state.activePhoto.lat;
+  const lng = pm.gpsOverride ? pm.gpsOverride.lng : state.activePhoto.lng;
+  el.gpsLatInput.value = (lat != null && isFinite(lat)) ? lat.toFixed(6) : '';
+  el.gpsLngInput.value = (lng != null && isFinite(lng)) ? lng.toFixed(6) : '';
+  el.coordsError.classList.add('hidden');
+  el.coordsEditArea.classList.remove('hidden');
+  el.setCoordsBtn.classList.add('hidden');
+  state.pickingCoords = true;
+  state.map?.getContainer().classList.add('cursor-crosshair');
+}
+
+function exitCoordsEditMode() {
+  state.pickingCoords = false;
+  el.coordsEditArea?.classList.add('hidden');
+  el.setCoordsBtn?.classList.remove('hidden');
+  state.map?.getContainer().classList.remove('cursor-crosshair');
+}
+
+async function handleSaveCoords() {
+  const lat = parseFloat(el.gpsLatInput.value);
+  const lng = parseFloat(el.gpsLngInput.value);
+  if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+    el.coordsError.textContent = 'Enter a valid latitude (−90 to 90) and longitude (−180 to 180).';
+    el.coordsError.classList.remove('hidden');
+    return;
+  }
+  el.coordsError.classList.add('hidden');
+
+  const fp    = state.activePhoto.filePath;
+  const pm    = getPhotoMeta(fp);
+  const entry = state.markers.find(m => m.data.filePath === fp);
+
+  state.lastGpsEdit = {
+    filePath: fp,
+    prevGpsOverride: pm.gpsOverride ? { ...pm.gpsOverride } : null,
+    prevBadGps: pm.badGps === true
+  };
+
+  pm.gpsOverride = { lat, lng };
+  pm.badGps      = false;
+
+  placeOrMoveMarker(entry, lat, lng);
+  setMarkerHighlight(fp, true);
+
+  el.photoCoords.textContent = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+  el.badGpsCheckbox.checked  = false;
+  el.undoCoordsBtn.classList.remove('hidden');
+  el.clearCoordsBtn.classList.remove('hidden');
+  exitCoordsEditMode();
+
+  await saveMetadata();
+  renderPhotoList();
+}
+
+
+async function handleUndoCoords() {
+  if (!state.lastGpsEdit) return;
+  const { filePath, prevGpsOverride, prevBadGps } = state.lastGpsEdit;
+  if (!state.activePhoto || state.activePhoto.filePath !== filePath) return;
+
+  const pm    = getPhotoMeta(filePath);
+  const entry = state.markers.find(m => m.data.filePath === filePath);
+
+  pm.gpsOverride = prevGpsOverride;
+  pm.badGps      = prevBadGps;
+
+  const effLat = prevGpsOverride ? prevGpsOverride.lat : entry.data.lat;
+  const effLng = prevGpsOverride ? prevGpsOverride.lng : entry.data.lng;
+
+  if (prevBadGps) {
+    if (entry.marker && entry.onMap) { entry.marker.remove(); entry.onMap = false; }
+  } else {
+    placeOrMoveMarker(entry, effLat, effLng);
+    setMarkerHighlight(filePath, true);
+  }
+
+  el.photoCoords.textContent = (effLat != null && effLng != null)
+    ? `${effLat.toFixed(6)}, ${effLng.toFixed(6)}` : 'None';
+  el.badGpsCheckbox.checked  = prevBadGps;
+  state.lastGpsEdit = null;
+  el.undoCoordsBtn.classList.add('hidden');
+  el.clearCoordsBtn.classList.toggle('hidden', !prevGpsOverride);
+
+  await saveMetadata();
+  renderPhotoList();
+}
+
+async function handleClearCoordsOverride() {
+  const fp = state.activePhoto?.filePath;
+  if (!fp) return;
+  const pm    = getPhotoMeta(fp);
+  const entry = state.markers.find(m => m.data.filePath === fp);
+  if (!pm.gpsOverride) return;
+
+  state.lastGpsEdit = {
+    filePath: fp,
+    prevGpsOverride: { ...pm.gpsOverride },
+    prevBadGps: pm.badGps === true
+  };
+
+  pm.gpsOverride = null;
+
+  const exifLat = entry.data.lat;
+  const exifLng = entry.data.lng;
+
+  if (exifLat != null && exifLng != null) {
+    placeOrMoveMarker(entry, exifLat, exifLng);
+    setMarkerHighlight(fp, true);
+    el.photoCoords.textContent = `${exifLat.toFixed(6)}, ${exifLng.toFixed(6)}`;
+  } else {
+    pm.badGps = true;
+    if (entry.marker && entry.onMap) { entry.marker.remove(); entry.onMap = false; }
+    el.photoCoords.textContent = 'None';
+    el.badGpsCheckbox.checked  = true;
+  }
+
+  el.clearCoordsBtn.classList.add('hidden');
+  el.undoCoordsBtn.classList.remove('hidden');
+
+  await saveMetadata();
+  renderPhotoList();
 }
 
 // ─── Notes ────────────────────────────────────────────────────────────────────
@@ -819,14 +1278,17 @@ async function handleRename() {
 
   if (!result.success) { showRenameError(result.error); return; }
 
-  const oldPath = state.activePhoto.filePath;
+  const oldPath      = state.activePhoto.filePath;
+  const resolvedName = result.newName;  // may differ from newName if deduplicated
+  const resolvedExt  = getExtension(resolvedName);
+  const resolvedBase = resolvedName.slice(0, -resolvedExt.length);
 
   // Capture a snapshot BEFORE updating state so undo can reverse everything.
   state.lastRename = {
     oldPath,
     oldName:      state.activePhoto.filename,
     newPath:      result.newPath,
-    newName,
+    newName:      resolvedName,
     // Deep copy the current metadata entry so undo can restore it exactly.
     metaSnapshot: state.meta.photos[oldPath]
       ? JSON.parse(JSON.stringify(state.meta.photos[oldPath]))
@@ -835,29 +1297,35 @@ async function handleRename() {
   el.undoRenameBtn.classList.remove('hidden');
 
   state.activePhoto.filePath = result.newPath;
-  state.activePhoto.filename = newName;
+  state.activePhoto.filename = resolvedName;
 
-  // Rekey the in-memory metadata so it matches the new file path.
-  // Without this, any subsequent saveMetadata() call would write a blank
-  // record under the new path and effectively erase the notes/flags/color
-  // that the main process already moved in photo-map-data.json.
+  // Rekey the in-memory metadata so it matches the new file path, then
+  // immediately persist — this is the single authoritative write for the
+  // rename.  All fields (note, badGps, pinColor, gpsOverride) travel with
+  // the photo because state.meta is the source of truth, not the disk snapshot.
   if (state.meta.photos[oldPath] !== undefined) {
     state.meta.photos[result.newPath] = state.meta.photos[oldPath];
     delete state.meta.photos[oldPath];
   }
+  await saveMetadata();
 
   const markerEntry = state.markers.find(m => m.data.filePath === oldPath);
   if (markerEntry) {
     markerEntry.data.filePath = result.newPath;
-    markerEntry.data.filename = newName;
-    markerEntry.marker.title  = newName;
+    markerEntry.data.filename = resolvedName;
+    // marker is null for bad-GPS photos — guard before accessing
+    if (markerEntry.marker) markerEntry.marker.options.title = resolvedName;
   }
 
   const photoEntry = state.photos.find(p => p.filePath === oldPath);
-  if (photoEntry) { photoEntry.filePath = result.newPath; photoEntry.filename = newName; }
+  if (photoEntry) { photoEntry.filePath = result.newPath; photoEntry.filename = resolvedName; }
+
+  // Update the rename field to show the actual name used (in case it was deduplicated).
+  el.renameInput.value     = resolvedBase;
+  el.renameExt.textContent = resolvedExt;
 
   renderPhotoList();
-  showRenameSuccess();
+  showRenameSuccess(resolvedName !== newName ? `✓ Renamed to "${resolvedName}"` : '✓ Renamed');
 }
 
 function showRenameError(msg)  { el.renameError.textContent = msg; el.renameError.classList.remove('hidden'); }
@@ -920,7 +1388,7 @@ async function handleUndoRename() {
   if (markerEntry) {
     markerEntry.data.filePath = u.oldPath;
     markerEntry.data.filename = u.oldName;
-    if (markerEntry.marker.title !== undefined) markerEntry.marker.title = u.oldName;
+    if (markerEntry.marker) markerEntry.marker.options.title = u.oldName;
   }
 
   const photoEntry = state.photos.find(p => p.filePath === u.newPath);
@@ -942,7 +1410,10 @@ async function handleUndoRename() {
  */
 function openLightbox() {
   if (!state.activePhoto) return;
-  const url = el.photoThumbnail.dataset.url;
+  const ext = getExtension(state.activePhoto.filename).toLowerCase();
+  const url = BROWSER_IMAGE_FORMATS.has(ext)
+    ? window.photoMap.filePathToUrl(state.activePhoto.filePath)
+    : el.photoThumbnail.dataset.url;
   if (!url) return;
 
   el.lightboxImg.src    = url;
@@ -1007,6 +1478,16 @@ function setupLightboxDrag() {
     dragging = false;
     el.lightboxInner.style.cursor = 'grab';
   });
+
+  // Close when clicking the dark backdrop around the photo. The image has
+  // pointer-events:none so all clicks land on lightboxInner; use the image's
+  // bounding rect to distinguish backdrop from photo.
+  el.lightboxInner.addEventListener('click', (e) => {
+    const r = el.lightboxImg.getBoundingClientRect();
+    const onPhoto = e.clientX >= r.left && e.clientX <= r.right &&
+                    e.clientY >= r.top  && e.clientY <= r.bottom;
+    if (!onPhoto) closeLightbox();
+  });
 }
 
 // ─── Resizable Sidebar ─────────────────────────────────────────────────────────
@@ -1049,6 +1530,7 @@ function setupSidebarResize() {
     // Dragging left increases width; dragging right decreases it.
     const delta = startX - e.clientX;
     applySidebarWidth(startW + delta);
+    state.map?.invalidateSize();
   });
 
   window.addEventListener('mouseup', () => {
@@ -1070,26 +1552,29 @@ function renderAllLabels() {
 }
 
 function createLabelMarker(labelData) {
-  const fontSize = { small: '12px', medium: '16px', large: '22px' }[labelData.size] || '16px';
-  const labelEl  = document.createElement('div');
-  labelEl.className   = 'map-label';
-  labelEl.style.fontSize = fontSize;
-  labelEl.textContent = labelData.text;
-
-  const marker = new google.maps.marker.AdvancedMarkerElement({
-    map:      state.labelsVisible ? state.map : null,
-    position: { lat: labelData.lat, lng: labelData.lng },
-    content:  labelEl
+  const fontSize = LABEL_FONT_SIZES[labelData.size] || '16px';
+  const icon = L.divIcon({
+    className: '',
+    html: `<div class="map-label" style="font-size:${fontSize}">${escapeHtml(labelData.text)}</div>`,
+    iconSize: null,
+    iconAnchor: [0, 0]
   });
 
-  marker.addListener('click', () => openEditLabelPopup(labelData));
+  const marker = L.marker([labelData.lat, labelData.lng], { icon });
+
+  if (state.labelsVisible) marker.addTo(state.map);
+
+  marker.on('click', (e) => {
+    L.DomEvent.stopPropagation(e);
+    openEditLabelPopup(labelData);
+  });
   state.labelMarkers.push({ marker, labelData });
 }
 
 function toggleLabelPlacementMode() {
   state.placingLabel = !state.placingLabel;
   el.addLabelBtn.classList.toggle('active', state.placingLabel);
-  document.getElementById('map').style.cursor = state.placingLabel ? 'crosshair' : '';
+  el.mapDiv.style.cursor = state.placingLabel ? 'crosshair' : '';
   el.addLabelBtn.textContent = state.placingLabel ? '✕ Cancel' : '+ Label';
   if (state.placingLabel) closeLabelPopup();
 }
@@ -1098,7 +1583,7 @@ function showLabelPopupAtLatLng(latLng) {
   state.placingLabel = false;
   el.addLabelBtn.textContent = '+ Label';
   el.addLabelBtn.classList.remove('active');
-  document.getElementById('map').style.cursor = '';
+  el.mapDiv.style.cursor = '';
 
   state.pendingLabelLatLng = latLng;
   state.editingLabelId = null;
@@ -1109,19 +1594,16 @@ function showLabelPopupAtLatLng(latLng) {
   el.saveLabelBtn.textContent    = 'Place Label';
   el.deleteLabelBtn.classList.add('hidden');
 
-  // Position popup near click point.
-  const projection = state.map.getProjection();
-  if (projection) {
-    const point  = projection.fromLatLngToPoint(latLng);
-    const scale  = Math.pow(2, state.map.getZoom());
-    const mapDiv = document.getElementById('map');
-    const bounds = mapDiv.getBoundingClientRect();
-    const center = projection.fromLatLngToPoint(state.map.getCenter());
-    const x = (point.x - center.x) * scale + bounds.width  / 2;
-    const y = (point.y - center.y) * scale + bounds.height / 2;
-    el.labelPopup.style.left = Math.min(x, bounds.width  - 220) + 'px';
-    el.labelPopup.style.top  = Math.max(10, y - 160) + 'px';
-  }
+  // latLngToContainerPoint returns coords relative to the map div's top-left.
+  // The popup is positioned absolutely inside #app-body, so we must add the
+  // map div's offset relative to #app-body (non-zero when the list panel is open).
+  const pt       = state.map.latLngToContainerPoint(latLng);
+  const mapRect  = el.mapDiv.getBoundingClientRect();
+  const bodyRect = el.appBody.getBoundingClientRect();
+  const x = pt.x + (mapRect.left - bodyRect.left);
+  const y = pt.y + (mapRect.top  - bodyRect.top);
+  el.labelPopup.style.left = Math.min(x, bodyRect.width - 220) + 'px';
+  el.labelPopup.style.top  = Math.max(10, y - 160) + 'px';
 
   el.labelPopup.classList.remove('hidden');
   el.labelTextInput.focus();
@@ -1166,8 +1648,13 @@ async function handleSaveLabel() {
       state.meta.labels[idx].size = size;
       const me = state.labelMarkers.find(m => m.labelData.id === state.editingLabelId);
       if (me) {
-        me.marker.content.textContent = text;
-        me.marker.content.style.fontSize = { small:'12px', medium:'16px', large:'22px' }[size] || '16px';
+        const fs = LABEL_FONT_SIZES[size] || '16px';
+        me.marker.setIcon(L.divIcon({
+          className: '',
+          html: `<div class="map-label" style="font-size:${fs}">${escapeHtml(text)}</div>`,
+          iconSize: null,
+          iconAnchor: [0, 0]
+        }));
         me.labelData.text = text; me.labelData.size = size;
       }
     }
@@ -1187,7 +1674,7 @@ async function handleSaveLabel() {
 async function handleDeleteLabel() {
   if (!state.editingLabelId) return;
   const mi = state.labelMarkers.findIndex(m => m.labelData.id === state.editingLabelId);
-  if (mi !== -1) { state.labelMarkers[mi].marker.map = null; state.labelMarkers.splice(mi, 1); }
+  if (mi !== -1) { state.labelMarkers[mi].marker.remove(); state.labelMarkers.splice(mi, 1); }
   state.meta.labels = state.meta.labels.filter(l => l.id !== state.editingLabelId);
   await saveMetadata();
   closeLabelPopup();
@@ -1205,8 +1692,13 @@ function closeLabelPopup() {
  */
 function setLabelsVisibility(visible) {
   state.labelsVisible = visible;
-  for (const { marker } of state.labelMarkers)
-    marker.map = visible ? state.map : null;
+  for (const { marker } of state.labelMarkers) {
+    if (visible) {
+      if (!state.map.hasLayer(marker)) marker.addTo(state.map);
+    } else {
+      if (state.map.hasLayer(marker)) marker.remove();
+    }
+  }
 }
 
 // ─── Settings Panel ────────────────────────────────────────────────────────────
@@ -1283,7 +1775,7 @@ async function handleSaveSettings() {
 /*
  * Binds all event listeners for the main app view (toolbar, info panel,
  * settings, Quick Rename, lightbox, label popup, sidebar resize, and lock screen).
- * Called once during init() before Google Maps loads.
+ * Called once during init() before the Leaflet map loads.
  */
 function bindAppEvents() {
 
@@ -1291,6 +1783,7 @@ function bindAppEvents() {
   el.toggleListBtn.addEventListener('click', () => {
     el.photoListPanel.classList.toggle('hidden');
     el.toggleListBtn.classList.toggle('active', !el.photoListPanel.classList.contains('hidden'));
+    state.map?.invalidateSize();
   });
   el.addLabelBtn.addEventListener('click', toggleLabelPlacementMode);
   el.rescanBtn.addEventListener('click', scanAndDisplay);
@@ -1312,6 +1805,8 @@ function bindAppEvents() {
 
   // Info panel
   el.closePanelBtn.addEventListener('click', closeInfoPanel);
+  el.prevPhotoBtn.addEventListener('click', () => navigatePhoto(-1));
+  el.nextPhotoBtn.addEventListener('click', () => navigatePhoto(1));
   el.renameBtn.addEventListener('click', handleRename);
   el.renameInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') handleRename();
@@ -1333,6 +1828,13 @@ function bindAppEvents() {
   el.photoNotes.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleSaveNote();
   });
+  el.setCoordsBtn.addEventListener('click', enterCoordsEditMode);
+  el.saveCoordsBtn.addEventListener('click', handleSaveCoords);
+  el.cancelCoordsBtn.addEventListener('click', exitCoordsEditMode);
+  el.undoCoordsBtn.addEventListener('click', handleUndoCoords);
+  el.clearCoordsBtn.addEventListener('click', handleClearCoordsOverride);
+  el.gpsLatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') handleSaveCoords(); });
+  el.gpsLngInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') handleSaveCoords(); });
   el.badGpsCheckbox.addEventListener('change', handleBadGpsToggle);
   el.photoPinColor.addEventListener('change', handlePhotoPinColorChange);
   el.resetPinColorBtn.addEventListener('click', handleResetPinColor);
@@ -1343,7 +1845,9 @@ function bindAppEvents() {
 
   // Lightbox
   el.lightboxClose.addEventListener('click', closeLightbox);
-  el.lightbox.addEventListener('click', (e) => { if (e.target === el.lightbox) closeLightbox(); });
+  el.lightbox.addEventListener('click', (e) => {
+    if (e.target === el.lightbox || e.target === el.lightboxCaption) closeLightbox();
+  });
   el.lightboxInner.addEventListener('wheel', handleLightboxWheel, { passive: false });
   setupLightboxDrag();
   document.addEventListener('keydown', (e) => {
@@ -1353,6 +1857,18 @@ function bindAppEvents() {
       if (!el.readmeOverlay.classList.contains('hidden'))   { closeReadme();       return; }
       if (!qrEl.overlay.classList.contains('hidden'))       { closeQuickRename();  return; }
       closeInfoPanel();
+    }
+
+    // ← / → navigates the photo list when the info panel is open.
+    // Skipped when focus is inside a text field to avoid hijacking typing.
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      const tag = e.target.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      if (el.infoPanel.classList.contains('hidden'))        return;
+      if (!el.lightbox.classList.contains('hidden'))        return;
+      if (!qrEl.overlay.classList.contains('hidden'))       return;
+      e.preventDefault();
+      navigatePhoto(e.key === 'ArrowLeft' ? -1 : 1);
     }
   });
 
@@ -1409,7 +1925,7 @@ function bindAppEvents() {
       hideLockError();
       showScreen('app');
       setFolderName(state.folderPath);
-      loadGoogleMaps(state.apiKey);
+      launchMap();
     } else {
       // Still locked — refresh the detail message with up-to-date info.
       showLockError(result, state.folderPath);
@@ -1444,9 +1960,9 @@ const qr = {
   photos:        [],     // all photos sorted alphabetically
   index:         0,      // current position
   loading:       false,  // guard against double-advance during async thumbnail load
-  miniMap:       null,   // google.maps.Map instance for the left panel
-  miniMarker:    null,   // AdvancedMarkerElement for the current photo's pin
-  miniMapLabels: [],     // AdvancedMarkerElements mirroring the main map's labels.
+  miniMap:       null,   // L.Map instance for the left panel
+  miniMarker:    null,   // L.Marker for the current photo's pin
+  miniMapLabels: [],     // L.Markers mirroring the main map's labels.
                          // Rebuilt every time Quick Rename opens so new/deleted
                          // labels are always reflected correctly.
   lastState:     null,   // Snapshot for undo: { index, filePath, filename, metaSnapshot }
@@ -1493,41 +2009,49 @@ function openQuickRename() {
   qrEl.overlay.classList.remove('hidden');
   document.body.style.overflow = 'hidden';
 
-  // Initialise the mini map once (Google Maps must already be loaded).
-  if (!qr.miniMap && window.google?.maps) {
-    qr.miniMap = new google.maps.Map(qrEl.mapDiv, {
-      zoom: 20,
-      center: { lat: 20, lng: 0 },
-      mapTypeId: 'satellite',
-      disableDefaultUI: true,
-      gestureHandling: 'cooperative',
-      mapId: 'qr-mini-map'
+  // Initialise the mini map once (Leaflet is always available).
+  // invalidateSize() is called unconditionally below so the map always
+  // gets correct dimensions after the overlay becomes visible.
+  if (!qr.miniMap) {
+    qr.miniMap = L.map(qrEl.mapDiv, {
+      zoom:             18,
+      center:           [20, 0],
+      zoomControl:      false,
+      attributionControl: true
     });
+    L.tileLayer(
+      `https://api.maptiler.com/maps/satellite/{z}/{x}/{y}.jpg?key=${state.apiKey}`,
+      {
+        tileSize:    512,
+        zoomOffset:  -1,
+        maxZoom:     22,
+        attribution: MAPTILER_ATTRIBUTION,
+        crossOrigin: true
+      }
+    ).addTo(qr.miniMap);
   }
 
-  // Rebuild the label markers on the mini map every time Quick Rename opens.
-  // We do this unconditionally (not just on first init) so that any labels
-  // added or deleted since the last session are always reflected correctly.
-  if (qr.miniMap) {
-    // Remove any previously placed label markers.
-    for (const m of qr.miniMapLabels) m.map = null;
-    qr.miniMapLabels = [];
+  // Rebuild the label markers on the mini map every time Quick Rename opens
+  // so that any labels added or deleted since the last session are reflected.
+  for (const m of qr.miniMapLabels) m.remove();
+  qr.miniMapLabels = [];
 
-    // Place a fresh copy of each label from the current session.
-    for (const { labelData } of state.labelMarkers) {
-      const fontSize = { small: '12px', medium: '16px', large: '22px' }[labelData.size] || '16px';
-      const labelEl  = document.createElement('div');
-      labelEl.className      = 'map-label';
-      labelEl.style.fontSize = fontSize;
-      labelEl.textContent    = labelData.text;
-      const m = new google.maps.marker.AdvancedMarkerElement({
-        map:      qr.miniMap,
-        position: { lat: labelData.lat, lng: labelData.lng },
-        content:  labelEl
-      });
-      qr.miniMapLabels.push(m);
-    }
+  for (const { labelData } of state.labelMarkers) {
+    const fontSize = LABEL_FONT_SIZES[labelData.size] || '16px';
+    const m = L.marker([labelData.lat, labelData.lng], {
+      icon: L.divIcon({
+        className: '',
+        html: `<div class="map-label" style="font-size:${fontSize}">${escapeHtml(labelData.text)}</div>`,
+        iconSize: null,
+        iconAnchor: [0, 0]
+      })
+    }).addTo(qr.miniMap);
+    qr.miniMapLabels.push(m);
   }
+
+  // Tell Leaflet the mini map container now has its final dimensions.
+  // Must run after the overlay is visible so getBoundingClientRect is non-zero.
+  qr.miniMap.invalidateSize();
 
   // Bind events once.
   if (!qrEl.overlay.dataset.bound) {
@@ -1608,28 +2132,29 @@ async function qrLoadPhoto(idx) {
   qrEl.badGpsChk.checked = pm.badGps === true;
   qrEl.badGpsLabel.classList.toggle('is-flagged', pm.badGps === true);
 
-  // Coordinates
-  qrEl.coords.textContent = `${photo.lat.toFixed(5)}, ${photo.lng.toFixed(5)}`;
+  // Coordinates — use override if set, fall back to EXIF, else show none.
+  const effLat = pm.gpsOverride ? pm.gpsOverride.lat : photo.lat;
+  const effLng = pm.gpsOverride ? pm.gpsOverride.lng : photo.lng;
+  qrEl.coords.textContent = (effLat != null && effLng != null)
+    ? `${effLat.toFixed(5)}, ${effLng.toFixed(5)}`
+    : 'No GPS data';
 
-  // Mini map — jump directly to this photo's location at full zoom.
-  // We use setZoom + setCenter rather than panTo because panTo animates
-  // from the previous position and can leave the map at the wrong zoom level
-  // if the map isn't fully settled yet.
+  // Mini map — only position when coords are available.
   if (qr.miniMap) {
-    const pos = { lat: photo.lat, lng: photo.lng };
-    qr.miniMap.setZoom(20);
-    qr.miniMap.setCenter(pos);
-
-    if (qr.miniMarker) {
-      qr.miniMarker.position = pos;
+    if (effLat != null && effLng != null) {
+      const pos = [effLat, effLng];
+      qr.miniMap.setView(pos, 18, { animate: false });
+      if (qr.miniMarker) {
+        qr.miniMarker.setLatLng(pos);
+        qr.miniMarker.setIcon(createPinIcon(resolveColor(photo.filePath)));
+      } else {
+        qr.miniMarker = L.marker(pos, {
+          icon: createPinIcon(resolveColor(photo.filePath))
+        }).addTo(qr.miniMap);
+      }
     } else {
-      const pin = new google.maps.marker.PinElement({
-        background: resolveColor(photo.filePath),
-        borderColor: '#ffffff', glyphColor: '#ffffff', glyph: '📷'
-      });
-      qr.miniMarker = new google.maps.marker.AdvancedMarkerElement({
-        map: qr.miniMap, position: pos, content: pin.element
-      });
+      // No location — hide the mini marker if one exists from a previous photo.
+      if (qr.miniMarker) { qr.miniMarker.remove(); qr.miniMarker = null; }
     }
   }
 
@@ -1639,17 +2164,21 @@ async function qrLoadPhoto(idx) {
   qrEl.loading.style.display = 'flex';
   qrEl.loading.textContent   = 'Loading…';
 
-  const thumbPath = await window.photoMap.getThumbnail(photo.filePath);
-  if (thumbPath) {
-    const url = window.photoMap.filePathToUrl(thumbPath);
+  const qrUrl = await resolvePhotoDisplayUrl(photo.filePath, photo.filename);
+
+  // Guard against stale loads: if the user advanced to another photo while
+  // this thumbnail was decoding (slow HEIC), discard the result silently.
+  if (qr.index !== idx) return;
+
+  if (qrUrl) {
+    qrEl.img.dataset.url = qrUrl;
     qrEl.img.onload = () => {
       qrEl.img.style.opacity     = '1';
       qrEl.loading.style.display = 'none';
       qrEl.zoomBtn.classList.remove('hidden');
-      qrEl.img.dataset.url = url;
       qr.loading = false;
     };
-    qrEl.img.src = url;
+    qrEl.img.src = qrUrl;
   } else {
     qrEl.loading.textContent = 'No preview available';
     qr.loading = false;
@@ -1784,23 +2313,31 @@ async function qrSaveAndNext() {
     return;
   }
 
-  // Keep all state in sync after rename.
+  const resolvedName = result.newName;
+
+  // Rekey and persist — same single-source-of-truth approach as handleRename.
   if (state.meta.photos[photo.filePath] !== undefined) {
     state.meta.photos[result.newPath] = state.meta.photos[photo.filePath];
     delete state.meta.photos[photo.filePath];
   }
+  await saveMetadata();
 
   const sp = state.photos.find(p => p.filePath === photo.filePath);
-  if (sp) { sp.filePath = result.newPath; sp.filename = newName; }
+  if (sp) { sp.filePath = result.newPath; sp.filename = resolvedName; }
 
   const me = state.markers.find(m => m.data.filePath === photo.filePath);
   if (me) {
-    me.data.filePath = result.newPath; me.data.filename = newName;
-    if (me.marker.title !== undefined) me.marker.title = newName;
+    me.data.filePath = result.newPath; me.data.filename = resolvedName;
+    if (me.marker) me.marker.options.title = resolvedName;
   }
 
   photo.filePath = result.newPath;
-  photo.filename = newName;
+  photo.filename = resolvedName;
+
+  // Update the name input so it reflects the actual name used.
+  const resolvedExt  = getExtension(resolvedName);
+  qrEl.nameInput.value   = resolvedName.slice(0, -resolvedExt.length);
+  qrEl.extSpan.textContent = resolvedExt;
 
   renderPhotoList();
   qrLoadPhoto(qr.index + 1);
@@ -1880,7 +2417,12 @@ async function qrUndo() {
  * Opens the zoom lightbox from Quick Rename.
  */
 function qrOpenZoom() {
-  const url = qrEl.img.dataset.url;
+  const photo = qr.photos[qr.index];
+  if (!photo) return;
+  const ext = getExtension(photo.filename).toLowerCase();
+  const url = BROWSER_IMAGE_FORMATS.has(ext)
+    ? window.photoMap.filePathToUrl(photo.filePath)
+    : (qrEl.img.dataset.url || '');
   if (!url) return;
   el.lightboxImg.src = url;
   el.lightboxCaption.textContent = qr.photos[qr.index]?.filename || '';
@@ -1899,6 +2441,7 @@ function closeQuickRename() {
   document.body.style.overflow = '';
   qrEl.img.src = '';
   qrEl.img.dataset.url = '';
+  if (state.activePhoto) openInfoPanel(state.activePhoto);
 }
 
 // ─── Export ───────────────────────────────────────────────────────────────────
@@ -1912,7 +2455,18 @@ function closeQuickRename() {
  * Input: format — 'geojson' or 'csv'
  */
 async function handleExport(format) {
-  if (!state.photos.length) {
+  const exportPhotos = state.photos
+    .map(p => {
+      const pm = getPhotoMeta(p.filePath);
+      if (pm.badGps) return null;
+      const lat = pm.gpsOverride ? pm.gpsOverride.lat : p.lat;
+      const lng = pm.gpsOverride ? pm.gpsOverride.lng : p.lng;
+      if (lat == null || lng == null) return null;
+      return { ...p, lat, lng };
+    })
+    .filter(Boolean);
+
+  if (!exportPhotos.length) {
     showSettingsMessage('No photos with GPS to export.', 'error');
     return;
   }
@@ -1920,7 +2474,7 @@ async function handleExport(format) {
   let result;
   try {
     result = await window.photoMap.exportData({
-      photos:   state.photos,
+      photos:   exportPhotos,
       metadata: state.meta,
       format
     });
@@ -1976,10 +2530,8 @@ function closeReadme() {
 
 /*
  * Converts a subset of Markdown to safe HTML for display inside the app.
- * Handles: headings (# ## ###), bold (**), code blocks (```), inline code (`),
- * horizontal rules (---), unordered lists (- item), and paragraphs.
- * All HTML characters in the source text are escaped before conversion so
- * the README content cannot inject scripts or break the layout.
+ * Handles: headings, bold, inline code, fenced code blocks, horizontal rules,
+ * unordered lists, ordered lists, blockquotes, GFM tables, and [links](url).
  *
  * Input:  md — a Markdown string
  * Returns: an HTML string safe to set as innerHTML
@@ -1987,91 +2539,180 @@ function closeReadme() {
 function markdownToHtml(md) {
   const lines = md.split('\n');
   const out   = [];
-  let inCodeBlock  = false;
-  let inList       = false;
-  let codeLang     = '';
-  let codeLines    = [];
+  let inCodeBlock   = false;
+  let inList        = false;
+  let inOrderedList = false;
+  let inTable       = false;
+  let tableLines    = [];
+  let codeLang      = '';
+  let codeLines     = [];
 
   /*
-   * Flushes a collected list and resets the list state.
+   * Converts raw (unescaped) inline text to safe HTML.
+   * Processes tokens left-to-right so backtick spans take priority over links,
+   * and links take priority over bold markers.
    */
-  function flushList() {
-    if (inList) { out.push('</ul>'); inList = false; }
+  function inlineFormat(raw) {
+    let result = '';
+    let i = 0;
+    let textStart = 0;
+
+    function flushPlain(end) {
+      if (end > textStart) result += escapeHtml(raw.slice(textStart, end));
+      textStart = end;
+    }
+
+    while (i < raw.length) {
+      // Inline code: `text`
+      if (raw[i] === '`') {
+        const end = raw.indexOf('`', i + 1);
+        if (end !== -1) {
+          flushPlain(i);
+          result += `<code class="md-inline-code">${escapeHtml(raw.slice(i + 1, end))}</code>`;
+          i = end + 1; textStart = i; continue;
+        }
+      }
+      // Link: [text](url)
+      if (raw[i] === '[') {
+        const cb = raw.indexOf(']', i + 1);
+        if (cb !== -1 && raw[cb + 1] === '(') {
+          const cp = raw.indexOf(')', cb + 2);
+          if (cp !== -1) {
+            flushPlain(i);
+            const linkText = raw.slice(i + 1, cb);
+            const url      = raw.slice(cb + 2, cp);
+            const safeUrl  = /^https?:|^mailto:/i.test(url) ? url : '#';
+            result += `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(linkText)}</a>`;
+            i = cp + 1; textStart = i; continue;
+          }
+        }
+      }
+      // Bold: **text**
+      if (raw[i] === '*' && raw[i + 1] === '*') {
+        const end = raw.indexOf('**', i + 2);
+        if (end !== -1) {
+          flushPlain(i);
+          result += `<strong>${escapeHtml(raw.slice(i + 2, end))}</strong>`;
+          i = end + 2; textStart = i; continue;
+        }
+      }
+      i++;
+    }
+    flushPlain(i);
+    return result;
   }
 
-  /*
-   * Applies inline Markdown formatting (bold, inline code) to a line of text
-   * that has already been HTML-escaped.  Order matters: code spans are applied
-   * first so that bold markers inside them are not processed.
-   */
-  function inlineFormat(text) {
-    // Inline code: `text` → <code>text</code>
-    text = text.replace(/`([^`]+)`/g, (_, code) =>
-      `<code class="md-inline-code">${code}</code>`
-    );
-    // Bold: **text** → <strong>text</strong>
-    text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    return text;
+  function flushList() {
+    if (inList)        { out.push('</ul>'); inList        = false; }
+    if (inOrderedList) { out.push('</ol>'); inOrderedList = false; }
+  }
+
+  function flushTable() {
+    if (!inTable) return;
+    inTable = false;
+    const rows = tableLines;
+    tableLines = [];
+    if (rows.length < 2) {
+      rows.forEach(r => out.push(`<p class="md-p">${inlineFormat(r)}</p>`));
+      return;
+    }
+    const parseRow = line => line.split('|').slice(1, -1).map(c => c.trim());
+    const isSep    = cells => cells.length > 0 && cells.every(c => /^[-: ]+$/.test(c));
+    const headers  = parseRow(rows[0]);
+    if (!isSep(parseRow(rows[1]))) {
+      rows.forEach(r => out.push(`<p class="md-p">${inlineFormat(r)}</p>`));
+      return;
+    }
+    let html = '<table class="md-table"><thead><tr>';
+    headers.forEach(c => { html += `<th class="md-th">${inlineFormat(c)}</th>`; });
+    html += '</tr></thead><tbody>';
+    for (let j = 2; j < rows.length; j++) {
+      html += '<tr>';
+      parseRow(rows[j]).forEach(c => { html += `<td class="md-td">${inlineFormat(c)}</td>`; });
+      html += '</tr>';
+    }
+    html += '</tbody></table>';
+    out.push(html);
   }
 
   for (let i = 0; i < lines.length; i++) {
     const raw  = lines[i];
     const line = raw.trimEnd();
 
-    // ── Fenced code block (``` lang) ───────────────────────────────────────
+    // ── Fenced code block ──────────────────────────────────────────────────
     if (line.startsWith('```')) {
       if (!inCodeBlock) {
-        flushList();
+        flushList(); flushTable();
         inCodeBlock = true;
         codeLang    = line.slice(3).trim();
         codeLines   = [];
       } else {
-        // Closing fence — emit the block.
-        const escaped = codeLines.map(l => escapeHtml(l)).join('\n');
+        const escaped  = codeLines.map(l => escapeHtml(l)).join('\n');
         const langAttr = codeLang ? ` class="md-code-lang-${escapeHtml(codeLang)}"` : '';
         out.push(`<pre class="md-code-block"><code${langAttr}>${escaped}</code></pre>`);
-        inCodeBlock = false;
-        codeLines   = [];
-        codeLang    = '';
+        inCodeBlock = false; codeLines = []; codeLang = '';
       }
       continue;
     }
-
     if (inCodeBlock) { codeLines.push(raw); continue; }
 
     // ── Blank line ─────────────────────────────────────────────────────────
-    if (!line.trim()) {
+    if (!line.trim()) { flushList(); flushTable(); continue; }
+
+    // ── Table row ──────────────────────────────────────────────────────────
+    if (line.trimStart().startsWith('|')) {
       flushList();
+      inTable = true;
+      tableLines.push(line);
       continue;
     }
+    flushTable();
 
     // ── Headings ───────────────────────────────────────────────────────────
     const h3 = line.match(/^### (.+)/);
     const h2 = line.match(/^## (.+)/);
     const h1 = line.match(/^# (.+)/);
-    if (h1) { flushList(); out.push(`<h1 class="md-h1">${inlineFormat(escapeHtml(h1[1]))}</h1>`); continue; }
-    if (h2) { flushList(); out.push(`<h2 class="md-h2">${inlineFormat(escapeHtml(h2[1]))}</h2>`); continue; }
-    if (h3) { flushList(); out.push(`<h3 class="md-h3">${inlineFormat(escapeHtml(h3[1]))}</h3>`); continue; }
+    if (h1) { flushList(); out.push(`<h1 class="md-h1">${inlineFormat(h1[1])}</h1>`); continue; }
+    if (h2) { flushList(); out.push(`<h2 class="md-h2">${inlineFormat(h2[1])}</h2>`); continue; }
+    if (h3) { flushList(); out.push(`<h3 class="md-h3">${inlineFormat(h3[1])}</h3>`); continue; }
 
     // ── Horizontal rule ────────────────────────────────────────────────────
     if (/^---+$/.test(line.trim())) { flushList(); out.push('<hr class="md-hr"/>'); continue; }
 
-    // ── Unordered list item ────────────────────────────────────────────────
+    // ── Blockquote ─────────────────────────────────────────────────────────
+    const bq = line.match(/^> (.+)/);
+    if (bq) {
+      flushList();
+      out.push(`<blockquote class="md-blockquote">${inlineFormat(bq[1])}</blockquote>`);
+      continue;
+    }
+
+    // ── Unordered list ─────────────────────────────────────────────────────
     const li = line.match(/^[-*] (.+)/);
     if (li) {
+      if (inOrderedList) { out.push('</ol>'); inOrderedList = false; }
       if (!inList) { out.push('<ul class="md-ul">'); inList = true; }
-      out.push(`<li class="md-li">${inlineFormat(escapeHtml(li[1]))}</li>`);
+      out.push(`<li class="md-li">${inlineFormat(li[1])}</li>`);
+      continue;
+    }
+
+    // ── Ordered list ───────────────────────────────────────────────────────
+    const oli = line.match(/^\d+\. (.+)/);
+    if (oli) {
+      if (inList) { out.push('</ul>'); inList = false; }
+      if (!inOrderedList) { out.push('<ol class="md-ol">'); inOrderedList = true; }
+      out.push(`<li class="md-li">${inlineFormat(oli[1])}</li>`);
       continue;
     }
 
     // ── Paragraph ──────────────────────────────────────────────────────────
     flushList();
-    out.push(`<p class="md-p">${inlineFormat(escapeHtml(line))}</p>`);
+    out.push(`<p class="md-p">${inlineFormat(line)}</p>`);
   }
 
   flushList();
+  flushTable();
   if (inCodeBlock && codeLines.length) {
-    // Unclosed code block — emit what we have.
     out.push(`<pre class="md-code-block"><code>${codeLines.map(l => escapeHtml(l)).join('\n')}</code></pre>`);
   }
 
@@ -2088,7 +2729,7 @@ function markdownToHtml(md) {
  * Input: lockResult — the object returned by window.photoMap.acquireLock()
  *        folderPath — the folder that triggered the error
  */
-function showLockError(lockResult, folderPath) {
+function showLockError(lockResult, _folderPath) {
   if (lockResult.error === 'locked') {
     const lb = lockResult.lockedBy || {};
 
@@ -2201,7 +2842,7 @@ function formatDateShort(isoString) {
     return new Date(isoString).toLocaleDateString(undefined, {
       year: 'numeric', month: 'short', day: 'numeric'
     });
-  } catch { return isoString; }
+  } catch { return escapeHtml(String(isoString)); }
 }
 
 // Safely converts a string so it can be placed in innerHTML without XSS.
@@ -2209,6 +2850,21 @@ function escapeHtml(str) {
   return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// Validates a CSS color value is a safe hex string before use in style attributes.
+// Only accepts #rgb, #rrggbb, and #rrggbbaa — the formats produced by <input type="color">.
+// Any other value (could contain CSS injection) is replaced with the default blue.
+function sanitizeColor(color) {
+  if (typeof color === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(color)) return color;
+  return '#4f8ef7';
+}
+
 // ─── Start ─────────────────────────────────────────────────────────────────────
+
+// Surface unhandled promise rejections in the status bar rather than silently
+// swallowing them. Helps catch any async edge cases that slip past error handling.
+window.addEventListener('unhandledrejection', (event) => {
+  console.error('Unhandled promise rejection in renderer:', event.reason);
+  setStatus(`⚠ Unexpected error: ${event.reason?.message || event.reason}`);
+});
 
 document.addEventListener('DOMContentLoaded', init);
