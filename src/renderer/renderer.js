@@ -881,19 +881,24 @@ async function watchFolder() {
 
 async function handleFolderChange({ type, filePath }) {
   if (type === 'add') {
-    const result = await window.photoMap.scanFolder({ folderPath: state.folderPath, recursive: state.recursive });
-    if (result.error) {
-      setStatus(`⚠ ${result.error}`);
-    } else {
-      clearPhotoMarkers();
-      state.photos = result.photos;
-      await mergeNoGpsPhotos(result.noGpsPhotos);
-      placePhotoMarkers(state.photos);
-      // Rebuild markers clears the highlight — restore it if a photo is still open.
-      if (state.activePhoto) setMarkerHighlight(state.activePhoto.filePath, true);
-      renderPhotoList();
-      setStatus(`${result.totalScanned} photos · ${result.totalWithGps} with GPS`);
+    // Scan only the new file rather than re-scanning the entire folder.
+    const result = await window.photoMap.scanSingleFile(filePath);
+    if (!result.success) {
+      setStatus(`⚠ Could not read new file: ${result.error}`);
+      return;
     }
+    const photoData = result.photo || result.noGps;
+    if (photoData) {
+      // mergeNoGpsPhotos handles auto-flagging and metadata init for no-GPS files.
+      if (result.noGps) {
+        await mergeNoGpsPhotos([result.noGps]);
+      } else {
+        state.photos.push(photoData);
+      }
+      createPhotoMarker(photoData);
+      renderPhotoList();
+    }
+    setStatus(`${state.photos.filter(p => p.lat != null).length} photos with GPS`);
   } else if (type === 'remove') {
     const idx = state.markers.findIndex(m => m.data.filePath === filePath);
     if (idx !== -1) {
@@ -901,6 +906,11 @@ async function handleFolderChange({ type, filePath }) {
       if (marker && onMap) marker.remove();
       state.markers.splice(idx, 1);
       state.photos = state.photos.filter(p => p.filePath !== filePath);
+      // Prune the deleted file's metadata so it doesn't accumulate as a ghost entry.
+      if (state.meta.photos[filePath]) {
+        delete state.meta.photos[filePath];
+        await saveMetadata();
+      }
       renderPhotoList();
       if (state.activePhoto?.filePath === filePath) closeInfoPanel();
       setStatus(`${state.photos.filter(p => p.lat != null).length} photos with GPS`);
@@ -1659,7 +1669,7 @@ async function handleSaveLabel() {
       }
     }
   } else {
-    const id  = 'label_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+    const id  = crypto.randomUUID();
     const lat = typeof latLng.lat === 'function' ? latLng.lat() : latLng.lat;
     const lng = typeof latLng.lng === 'function' ? latLng.lng() : latLng.lng;
     const newLabel = { id, lat, lng, text, size };

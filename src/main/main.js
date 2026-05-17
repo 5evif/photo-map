@@ -89,8 +89,9 @@ const store = new Store({
   }
 });
 
-const THUMBNAIL_CACHE_DIR = path.join(app.getPath('userData'), 'thumbnails');
-const GPS_CACHE_FILE      = path.join(app.getPath('userData'), 'gps-cache.json');
+const THUMBNAIL_CACHE_DIR      = path.join(app.getPath('userData'), 'thumbnails');
+const GPS_CACHE_FILE           = path.join(app.getPath('userData'), 'gps-cache.json');
+const THUMBNAIL_CACHE_MAX_BYTES = 500 * 1024 * 1024; // 500 MB — evict oldest thumbnails beyond this
 
 // This file lives inside the user's photo folder so data travels with the photos.
 const METADATA_FILENAME = 'photo-map-data.json';
@@ -102,6 +103,11 @@ const LOCK_FILENAME = 'photo-map-data.lock';
 
 // Track which folder we currently hold a lock on so we can release it cleanly.
 let currentLockFolder = null;
+
+// UUID written into the lock file we currently hold.  Used instead of PID as
+// the primary identity so settings reloads are recognised as the same session
+// and so we never accidentally release another instance's lock.
+let sessionLockUUID = null;
 
 let folderWatcher = null;  // chokidar watcher instance
 let mainWindow    = null;  // the BrowserWindow
@@ -272,12 +278,13 @@ function readLock(folderPath) {
 /*
  * Creates the lock file for the given folder, recording who opened it.
  *
- * Before writing, checks whether a lock file already exists:
- *   - If it belongs to this process (same PID) → already locked by us, succeed.
- *   - If the PID in the file is no longer running → stale lock from a crash,
- *     overwrite it and succeed.
- *   - If the PID is still running → genuinely locked by another instance, fail
- *     and return the lock holder's details.
+ * Uses O_EXCL (the 'wx' flag) to atomically create the file, which eliminates
+ * the TOCTOU race where two processes could both pass a "does the file exist?"
+ * check and both believe they hold the lock.
+ *
+ * Each lock file includes a random UUID.  Within a session, sessionLockUUID
+ * lets us recognise our own lock without relying solely on PID (which can be
+ * reused by unrelated processes after a crash).
  *
  * Input:  folderPath — the photo folder to lock
  * Returns: { success: true }
@@ -285,50 +292,68 @@ function readLock(folderPath) {
  *       or { success: false, error: 'unwritable', message: "..." }
  */
 function acquireLock(folderPath) {
-  const existing = readLock(folderPath);
+  const lockPath = lockFilePath(folderPath);
 
-  if (existing) {
-    // Same process — already our lock (e.g. Settings reload within a session).
-    if (existing.pid === process.pid) {
-      currentLockFolder = folderPath;
-      return { success: true };
-    }
-
-    // Different PID — check whether that process is still alive.
-    // process.kill(pid, 0) doesn't send a signal; it just checks existence.
-    // If the process is gone it throws an error, meaning the lock is stale.
-    const pidStillRunning = isPidRunning(existing.pid);
-
-    if (pidStillRunning) {
-      // Genuinely locked by another live instance — block access.
-      return {
-        success:  false,
-        error:    'locked',
-        lockedBy: existing
-      };
-    }
-
-    // Stale lock (app crashed or was force-killed without cleanup).
-    // Log it and fall through to overwrite with our own lock.
-    console.warn(
-      `Removing stale lock left by PID ${existing.pid} (${existing.user}@${existing.machine})`
-    );
-  }
-
-  // Folder is free — write our lock file.
-  try {
-    const lockData = {
+  // Atomically create the lock file.  Returns { success: true } on success,
+  // null when EEXIST (another holder beat us), or an error object on write failure.
+  function tryCreate() {
+    const uuid = crypto.randomUUID();
+    const data = {
+      uuid,
       user:      os.userInfo().username || os.userInfo().uid?.toString() || 'unknown',
-      machine:   os.hostname() || 'unknown',
+      machine:   os.hostname()          || 'unknown',
       pid:       process.pid,
       timestamp: new Date().toISOString()
     };
-    fs.writeFileSync(lockFilePath(folderPath), JSON.stringify(lockData, null, 2), 'utf8');
+    let fd;
+    try {
+      fd = fs.openSync(lockPath, 'wx'); // fails with EEXIST if file already exists
+    } catch (err) {
+      if (err.code === 'EEXIST') return null;
+      return { success: false, error: 'unwritable', message: err.message };
+    }
+    try {
+      fs.writeSync(fd, JSON.stringify(data, null, 2));
+      fs.closeSync(fd);
+    } catch (err) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+      return { success: false, error: 'unwritable', message: err.message };
+    }
+    sessionLockUUID   = uuid;
     currentLockFolder = folderPath;
     return { success: true };
-  } catch (err) {
-    return { success: false, error: 'unwritable', message: err.message };
   }
+
+  // First attempt: try to create atomically.
+  const first = tryCreate();
+  if (first !== null) return first;
+
+  // Lock file exists — read who holds it.
+  const existing = readLock(folderPath);
+
+  if (!existing) {
+    // File disappeared between our open attempt and our read — retry once.
+    return tryCreate() ?? { success: false, error: 'locked', lockedBy: {} };
+  }
+
+  // Same session (e.g. Settings "Save & Reload" within a running session).
+  if (existing.uuid && existing.uuid === sessionLockUUID) {
+    currentLockFolder = folderPath;
+    return { success: true };
+  }
+
+  // Different session: check if the PID is still alive.
+  if (isPidRunning(existing.pid)) {
+    return { success: false, error: 'locked', lockedBy: existing };
+  }
+
+  // Stale lock (app crashed or was force-killed without cleanup) — remove and retry.
+  console.warn(
+    `Removing stale lock left by PID ${existing.pid} (${existing.user}@${existing.machine})`
+  );
+  try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
+
+  return tryCreate() ?? { success: false, error: 'locked', lockedBy: existing };
 }
 
 /*
@@ -341,11 +366,16 @@ function releaseLock(folderPath) {
   try {
     const lp = lockFilePath(target);
     if (fs.existsSync(lp)) {
-      // Only delete the lock if it belongs to this process — never steal
-      // another instance's lock.
       const lock = readLock(target);
-      if (lock && lock.pid === process.pid) {
+      // Primary check: UUID must match our session — never steal another instance's lock.
+      // Fallback: old lock files written before the UUID field was added use PID only.
+      const isOurs = lock && (
+        (lock.uuid && lock.uuid === sessionLockUUID) ||
+        (!lock.uuid && lock.pid === process.pid)
+      );
+      if (isOurs) {
         fs.unlinkSync(lp);
+        sessionLockUUID = null;
       }
     }
   } catch (err) {
@@ -362,26 +392,26 @@ function releaseLock(folderPath) {
  *        recursive  — true to include subfolders
  * Returns: array of file-path strings
  */
-function collectPhotoFiles(folderPath, recursive) {
+async function collectPhotoFiles(folderPath, recursive) {
   const results = [];
 
-  function walk(dir) {
+  async function walk(dir) {
     let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); }
     catch (err) { console.error(`Cannot read ${dir}:`, err.message); return; }
 
     for (const entry of entries) {
       if (entry.name === METADATA_FILENAME) continue; // skip our own metadata file
-      if (entry.name === LOCK_FILENAME) continue;        // skip our own lock file
+      if (entry.name === LOCK_FILENAME) continue;     // skip our own lock file
       const full = path.join(dir, entry.name);
-      if (entry.isDirectory() && recursive) { walk(full); }
+      if (entry.isDirectory() && recursive) { await walk(full); }
       else if (entry.isFile() && SUPPORTED_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
         results.push(full);
       }
     }
   }
 
-  walk(folderPath);
+  await walk(folderPath);
   return results;
 }
 
@@ -391,7 +421,7 @@ function collectPhotoFiles(folderPath, recursive) {
  */
 async function extractPhotoData(filePath) {
   try {
-    const stat  = fs.statSync(filePath);
+    const stat  = await fs.promises.stat(filePath);
     const data  = await exifr.parse(filePath, {
       pick: ['GPSLatitude','GPSLongitude','GPSLatitudeRef','GPSLongitudeRef',
              'DateTimeOriginal','CreateDate']
@@ -429,16 +459,18 @@ async function scanFolder(folderPath, recursive) {
   const noGpsPhotos = [];
   const errors      = [];
 
-  const files = collectPhotoFiles(folderPath, recursive);
+  const files = await collectPhotoFiles(folderPath, recursive);
   const totalScanned = files.length;
 
-  const BATCH_SIZE = 20;
+  // Scale batch size to available CPU cores so we don't under-use multi-core
+  // machines or thrash single-core ones with excessive parallelism.
+  const BATCH_SIZE = Math.max(4, os.cpus().length);
   let processedCount = 0;
 
   for (let i = 0; i < files.length; i += BATCH_SIZE) {
     await Promise.all(files.slice(i, i + BATCH_SIZE).map(async (filePath) => {
       try {
-        const stat   = fs.statSync(filePath);
+        const stat   = await fs.promises.stat(filePath);
         const cached = cache[filePath];
 
         if (cached && cached.mtimeMs === stat.mtimeMs) {
@@ -472,11 +504,52 @@ async function scanFolder(folderPath, recursive) {
     }));
   }
 
-  saveGpsCache(updatedCache);
+  // Merge: preserve cache entries from other folders; replace entries for this
+  // folder with the freshly scanned results (which also drops entries for files
+  // that have since been deleted from this folder).
+  const folderPrefix = folderPath.endsWith(path.sep) ? folderPath : folderPath + path.sep;
+  const mergedCache  = { ...cache };
+  for (const fp of Object.keys(mergedCache)) {
+    if (fp.startsWith(folderPrefix) && !updatedCache[fp]) delete mergedCache[fp];
+  }
+  Object.assign(mergedCache, updatedCache);
+  saveGpsCache(mergedCache);
+
   return { photos, noGpsPhotos, totalScanned, totalWithGps: photos.length, errors };
 }
 
 // ─── Thumbnail Generation (worker thread) ─────────────────────────────────────
+
+/*
+ * Evicts the oldest thumbnails if the cache directory exceeds THUMBNAIL_CACHE_MAX_BYTES.
+ * Called asynchronously after each successful thumbnail write — does not block
+ * the caller or affect the returned thumbnail path.
+ */
+async function enforceThumbnailCacheSize() {
+  try {
+    const names   = await fs.promises.readdir(THUMBNAIL_CACHE_DIR);
+    const entries = (await Promise.all(
+      names.map(async n => {
+        const fp = path.join(THUMBNAIL_CACHE_DIR, n);
+        try { const s = await fs.promises.stat(fp); return { fp, size: s.size, mtime: s.mtimeMs }; }
+        catch { return null; }
+      })
+    )).filter(Boolean);
+
+    const total = entries.reduce((s, e) => s + e.size, 0);
+    if (total <= THUMBNAIL_CACHE_MAX_BYTES) return;
+
+    entries.sort((a, b) => a.mtime - b.mtime); // oldest first
+    let remaining = total;
+    for (const { fp, size } of entries) {
+      if (remaining <= THUMBNAIL_CACHE_MAX_BYTES) break;
+      await fs.promises.unlink(fp).catch(() => {});
+      remaining -= size;
+    }
+  } catch (err) {
+    console.error('Thumbnail cache eviction error:', err.message);
+  }
+}
 
 /*
  * Generates (or retrieves from cache) a JPEG thumbnail for a photo.
@@ -506,6 +579,7 @@ async function getThumbnail(filePath) {
     );
 
     worker.on('message', (result) => {
+      if (result.success) enforceThumbnailCacheSize(); // fire-and-forget; don't block the caller
       resolve(result.success ? result.thumbPath : null);
     });
 
@@ -554,6 +628,42 @@ ipcMain.handle('scan-folder', async (event, { folderPath, recursive }) => {
   if (!fs.existsSync(folderPath))
     return { error: 'Folder not found. Please select a different folder in Settings.' };
   return scanFolder(folderPath, recursive);
+});
+
+/*
+ * Scans a single newly-added file instead of the whole folder.
+ * Called by the renderer when chokidar reports a new photo so we don't
+ * re-extract EXIF from every file in the folder on each add event.
+ * Returns: { success, photo?, noGps? }
+ */
+ipcMain.handle('scan-single-file', async (event, filePath) => {
+  if (typeof filePath !== 'string' || !SUPPORTED_EXTENSIONS.has(path.extname(filePath).toLowerCase()))
+    return { success: false, error: 'Invalid file path' };
+  try {
+    const cache  = loadGpsCache();
+    const stat   = await fs.promises.stat(filePath);
+    const cached = cache[filePath];
+
+    let data;
+    if (cached && cached.mtimeMs === stat.mtimeMs) {
+      data = cached;
+    } else {
+      data = await extractPhotoData(filePath);
+      if (data) {
+        cache[filePath] = data;
+        saveGpsCache(cache);
+      }
+    }
+
+    if (!data) return { success: false, error: 'Could not read file metadata' };
+    return {
+      success: true,
+      photo:  !data.noGps ? data : null,
+      noGps:   data.noGps ? data : null
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
 });
 
 ipcMain.handle('get-thumbnail', async (event, filePath) => getThumbnail(filePath));
@@ -611,8 +721,11 @@ ipcMain.handle('show-in-folder', (event, filePath) => shell.showItemInFolder(fil
 // and returns the HTTP status code.  Used by the renderer to distinguish
 // "bad API key" (401/403) from "quota exceeded" (429) tile errors.
 ipcMain.handle('check-tile-status', (event, url) => {
-  // Only allow HTTPS requests to MapTiler domains to prevent SSRF.
-  if (typeof url !== 'string' || !/^https:\/\/[a-z0-9-]+\.maptiler\.com\//i.test(url))
+  // Use the URL constructor (not a regex) to parse the URL — this is immune to
+  // bypass tricks like embedded credentials or Unicode homoglyphs.
+  let parsed;
+  try { parsed = new URL(url); } catch { return { status: 0 }; }
+  if (parsed.protocol !== 'https:' || !parsed.hostname.endsWith('.maptiler.com'))
     return { status: 0 };
   return new Promise((resolve) => {
     const req = https.request(url, { method: 'HEAD' }, (res) => {
@@ -624,10 +737,10 @@ ipcMain.handle('check-tile-status', (event, url) => {
   });
 });
 
-ipcMain.handle('clear-thumbnail-cache', () => {
+ipcMain.handle('clear-thumbnail-cache', async () => {
   try {
-    const files = fs.readdirSync(THUMBNAIL_CACHE_DIR);
-    for (const f of files) fs.unlinkSync(path.join(THUMBNAIL_CACHE_DIR, f));
+    const files = await fs.promises.readdir(THUMBNAIL_CACHE_DIR);
+    await Promise.all(files.map(f => fs.promises.unlink(path.join(THUMBNAIL_CACHE_DIR, f))));
     return { success: true, count: files.length };
   } catch (err) { return { success: false, error: err.message }; }
 });
