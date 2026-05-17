@@ -22,7 +22,7 @@
   },
   "overrides": [
     {
-      "files": ["src/renderer/renderer.js"],
+      "files": ["src/renderer/**/*.js"],
       "env": {
         "browser": true,
         "node": false
