@@ -206,9 +206,6 @@ export const qrEl = {
 
 // ─── Shared Constants ──────────────────────────────────────────────────────────
 
-// Formats the browser (Chromium) can decode directly — no thumbnail needed.
-export const BROWSER_IMAGE_FORMATS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.avif']);
-
 export const LABEL_FONT_SIZES = { small: '12px', medium: '16px', large: '22px' };
 
 export const MAPTILER_ATTRIBUTION =

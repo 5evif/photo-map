@@ -67,13 +67,16 @@ const { Worker } = require('worker_threads'); // built into Node.js — runs thu
 const path   = require('path');
 const fs     = require('fs');
 const https  = require('https');
-const os     = require('os');     // built into Node.js — used for the machine hostname in lock files
+const os     = require('os');     // built into Node.js — used for cpu count (thumbnail pool)
 const crypto = require('crypto'); // built into Node.js — used to hash thumbnail filenames
 const Store  = require('electron-store');
 const chokidar = require('chokidar');
 const exifr    = require('exifr');  // reads GPS and date from photo EXIF metadata
-const { isPidRunning, csvEscape, SUPPORTED_EXTENSIONS } = require('../utils.js');
+const { SUPPORTED_EXTENSIONS } = require('../utils.js');
 const { METADATA_FILENAME, readMetadataFile, writeMetadataFileAtomic } = require('./metadata-io.js');
+const { LOCK_FILENAME, readLock, acquireLock, releaseLock } = require('./lock.js');
+const { collectPhotoFiles } = require('./scan.js');
+const { buildGeoJson, buildCsv } = require('./export-format.js');
 
 // ─── App-wide state ────────────────────────────────────────────────────────────
 
@@ -93,19 +96,6 @@ const store = new Store({
 const THUMBNAIL_CACHE_DIR      = path.join(app.getPath('userData'), 'thumbnails');
 const GPS_CACHE_FILE           = path.join(app.getPath('userData'), 'gps-cache.json');
 const THUMBNAIL_CACHE_MAX_BYTES = 500 * 1024 * 1024; // 500 MB — evict oldest thumbnails beyond this
-
-// The lock file sits next to the metadata file. Its presence means someone else
-// currently has this folder open and is editing annotations. We create it when
-// we open a folder and delete it when we close the app or switch folders.
-const LOCK_FILENAME = 'photo-map-data.lock';
-
-// Track which folder we currently hold a lock on so we can release it cleanly.
-let currentLockFolder = null;
-
-// UUID written into the lock file we currently hold.  Used instead of PID as
-// the primary identity so settings reloads are recognised as the same session
-// and so we never accidentally release another instance's lock.
-let sessionLockUUID = null;
 
 let folderWatcher = null;  // chokidar watcher instance
 let mainWindow    = null;  // the BrowserWindow
@@ -182,182 +172,6 @@ function loadGpsCache() {
 function saveGpsCache(cache) {
   try { fs.writeFileSync(GPS_CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8'); }
   catch (err) { console.error('Could not save GPS cache:', err.message); }
-}
-
-// ─── Lock File Management ─────────────────────────────────────────────────────
-//
-// We use a plain JSON file ("photo-map-data.lock") as a cooperative lock.
-// When Photo Map opens a folder it writes this file with the current user's
-// name, machine name, and a timestamp.  Before opening, it checks whether
-// the file already exists and reports back to the renderer so it can block
-// access and show a clear error message.
-//
-// Limitations: this is a cooperative lock, not a filesystem-level exclusive
-// lock.  It protects against two people running the app at the same time on
-// shared network storage.  It does not protect against someone deleting the
-// lock file manually, but that is an intentional escape hatch for stuck locks.
-
-/*
- * Returns the full path to the lock file for the given photo folder.
- * Example: "/Volumes/Server/Photos/photo-map-data.lock"
- */
-function lockFilePath(folderPath) {
-  return path.join(folderPath, LOCK_FILENAME);
-}
-
-/*
- * Reads and returns the contents of the lock file, or null if none exists.
- * Returns an object like: { user, machine, pid, timestamp }
- */
-function readLock(folderPath) {
-  try {
-    const lp = lockFilePath(folderPath);
-    if (fs.existsSync(lp))
-      return JSON.parse(fs.readFileSync(lp, 'utf8'));
-  } catch (err) {
-    console.warn('Could not read lock file:', err.message);
-  }
-  return null;
-}
-
-/*
- * Creates the lock file for the given folder, recording who opened it.
- *
- * Uses O_EXCL (the 'wx' flag) to atomically create the file, which eliminates
- * the TOCTOU race where two processes could both pass a "does the file exist?"
- * check and both believe they hold the lock.
- *
- * Each lock file includes a random UUID.  Within a session, sessionLockUUID
- * lets us recognise our own lock without relying solely on PID (which can be
- * reused by unrelated processes after a crash).
- *
- * Input:  folderPath — the photo folder to lock
- * Returns: { success: true }
- *       or { success: false, error: 'locked',    lockedBy: { user, machine, pid, timestamp } }
- *       or { success: false, error: 'unwritable', message: "..." }
- */
-function acquireLock(folderPath) {
-  const lockPath = lockFilePath(folderPath);
-
-  // Atomically create the lock file.  Returns { success: true } on success,
-  // null when EEXIST (another holder beat us), or an error object on write failure.
-  function tryCreate() {
-    const uuid = crypto.randomUUID();
-    const data = {
-      uuid,
-      user:      os.userInfo().username || os.userInfo().uid?.toString() || 'unknown',
-      machine:   os.hostname()          || 'unknown',
-      pid:       process.pid,
-      timestamp: new Date().toISOString()
-    };
-    let fd;
-    try {
-      fd = fs.openSync(lockPath, 'wx'); // fails with EEXIST if file already exists
-    } catch (err) {
-      if (err.code === 'EEXIST') return null;
-      return { success: false, error: 'unwritable', message: err.message };
-    }
-    try {
-      fs.writeSync(fd, JSON.stringify(data, null, 2));
-      fs.closeSync(fd);
-    } catch (err) {
-      try { fs.closeSync(fd); } catch { /* ignore */ }
-      return { success: false, error: 'unwritable', message: err.message };
-    }
-    sessionLockUUID   = uuid;
-    currentLockFolder = folderPath;
-    return { success: true };
-  }
-
-  // First attempt: try to create atomically.
-  const first = tryCreate();
-  if (first !== null) return first;
-
-  // Lock file exists — read who holds it.
-  const existing = readLock(folderPath);
-
-  if (!existing) {
-    // File disappeared between our open attempt and our read — retry once.
-    return tryCreate() ?? { success: false, error: 'locked', lockedBy: {} };
-  }
-
-  // Same session (e.g. Settings "Save & Reload" within a running session).
-  if (existing.uuid && existing.uuid === sessionLockUUID) {
-    currentLockFolder = folderPath;
-    return { success: true };
-  }
-
-  // Different session: check if the PID is still alive.
-  if (isPidRunning(existing.pid)) {
-    return { success: false, error: 'locked', lockedBy: existing };
-  }
-
-  // Stale lock (app crashed or was force-killed without cleanup) — remove and retry.
-  console.warn(
-    `Removing stale lock left by PID ${existing.pid} (${existing.user}@${existing.machine})`
-  );
-  try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
-
-  return tryCreate() ?? { success: false, error: 'locked', lockedBy: existing };
-}
-
-/*
- * Deletes the lock file for the given folder (or the currently locked folder
- * if no path is supplied).  Safe to call even if no lock exists.
- */
-function releaseLock(folderPath) {
-  const target = folderPath || currentLockFolder;
-  if (!target) return;
-  try {
-    const lp = lockFilePath(target);
-    if (fs.existsSync(lp)) {
-      const lock = readLock(target);
-      // Primary check: UUID must match our session — never steal another instance's lock.
-      // Fallback: old lock files written before the UUID field was added use PID only.
-      const isOurs = lock && (
-        (lock.uuid && lock.uuid === sessionLockUUID) ||
-        (!lock.uuid && lock.pid === process.pid)
-      );
-      if (isOurs) {
-        fs.unlinkSync(lp);
-        sessionLockUUID = null;
-      }
-    }
-  } catch (err) {
-    console.warn('Could not release lock file:', err.message);
-  }
-  if (target === currentLockFolder) currentLockFolder = null;
-}
-
-// ─── Folder Scanning ───────────────────────────────────────────────────────────
-
-/*
- * Recursively collects all photo file paths from a folder.
- * Input: folderPath — full path to the folder
- *        recursive  — true to include subfolders
- * Returns: array of file-path strings
- */
-async function collectPhotoFiles(folderPath, recursive) {
-  const results = [];
-
-  async function walk(dir) {
-    let entries;
-    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); }
-    catch (err) { console.error(`Cannot read ${dir}:`, err.message); return; }
-
-    for (const entry of entries) {
-      if (entry.name === METADATA_FILENAME) continue; // skip our own metadata file
-      if (entry.name === LOCK_FILENAME) continue;     // skip our own lock file
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory() && recursive) { await walk(full); }
-      else if (entry.isFile() && SUPPORTED_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
-        results.push(full);
-      }
-    }
-  }
-
-  await walk(folderPath);
-  return results;
 }
 
 /*
@@ -855,44 +669,7 @@ ipcMain.handle('export-data', async (event, { photos, metadata, format }) => {
   if (result.canceled) return { success: false, error: 'Cancelled' };
 
   try {
-    let output = '';
-
-    if (isGeoJson) {
-      // Build a GeoJSON FeatureCollection — each photo is a Point feature.
-      const features = photos.map(p => {
-        const pm = (metadata.photos || {})[p.filePath] || {};
-        return {
-          type: 'Feature',
-          geometry: { type: 'Point', coordinates: [p.lng, p.lat] }, // GeoJSON is [lng, lat]
-          properties: {
-            filename: p.filename,
-            filePath: p.filePath,
-            date:     p.date || null,
-            note:     pm.note     || '',
-            badGps:   pm.badGps   || false,
-            pinColor: pm.pinColor || null
-          }
-        };
-      });
-      output = JSON.stringify({ type: 'FeatureCollection', features }, null, 2);
-
-    } else {
-      // Build a CSV.
-      const header = ['filename', 'latitude', 'longitude', 'date', 'note', 'bad_gps'];
-      const rows   = photos.map(p => {
-        const pm = (metadata.photos || {})[p.filePath] || {};
-        return [
-          csvEscape(p.filename),
-          p.lat,
-          p.lng,
-          csvEscape(p.date || ''),
-          csvEscape(pm.note || ''),
-          pm.badGps ? 'true' : 'false'
-        ].join(',');
-      });
-      output = [header.join(','), ...rows].join('\n');
-    }
-
+    const output = isGeoJson ? buildGeoJson(photos, metadata) : buildCsv(photos, metadata);
     fs.writeFileSync(result.filePath, output, 'utf8');
     return { success: true, count: photos.length };
   } catch (err) {

@@ -274,11 +274,43 @@ function isPidRunning(pid) {
   }
 }
 
+// ─── Date Formatting ──────────────────────────────────────────────────────────
+
+/**
+ * Formats an ISO date string for the info panel (long form with time).
+ * Input:  isoString — ISO 8601 string
+ * Returns: locale-formatted string, or the input unchanged if invalid
+ */
+function formatDate(isoString) {
+  try {
+    return new Date(isoString).toLocaleString(undefined, {
+      year: 'numeric', month: 'long', day: 'numeric',
+      hour: 'numeric', minute: '2-digit'
+    });
+  } catch { return isoString; }
+}
+
+/**
+ * Formats an ISO date string for the photo list (short form, no time).
+ * Input:  isoString — ISO 8601 string
+ * Returns: locale-formatted string, or the HTML-escaped raw value if invalid
+ */
+function formatDateShort(isoString) {
+  try {
+    return new Date(isoString).toLocaleDateString(undefined, {
+      year: 'numeric', month: 'short', day: 'numeric'
+    });
+  } catch { return escapeHtml(String(isoString)); }
+}
+
 // ─── File Types ───────────────────────────────────────────────────────────────
 
 const SUPPORTED_EXTENSIONS = new Set([
   '.jpg', '.jpeg', '.heic', '.heif', '.png', '.webp', '.dng', '.avif'
 ]);
+
+// Formats the browser (Chromium) can decode directly — no thumbnail needed.
+const BROWSER_IMAGE_FORMATS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.avif']);
 
 // ─── Color Sanitization ───────────────────────────────────────────────────────
 
@@ -299,9 +331,12 @@ module.exports = {
   escapeHtml,
   getExtension,
   formatLockTimestamp,
+  formatDate,
+  formatDateShort,
   csvEscape,
   markdownToHtml,
   isPidRunning,
   sanitizeColor,
-  SUPPORTED_EXTENSIONS
+  SUPPORTED_EXTENSIONS,
+  BROWSER_IMAGE_FORMATS
 };

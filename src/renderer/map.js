@@ -5,8 +5,8 @@
 // handle their own follow-up UI updates.
 
 import L from 'leaflet';
-import { sanitizeColor } from '../utils.js';
-import { state, el, setStatus, BROWSER_IMAGE_FORMATS, MAPTILER_ATTRIBUTION } from './state.js';
+import { sanitizeColor, BROWSER_IMAGE_FORMATS } from '../utils.js';
+import { state, el, setStatus, MAPTILER_ATTRIBUTION } from './state.js';
 import { getPhotoMeta } from './metadata.js';
 import { openInfoPanel } from './infoPanel.js';
 

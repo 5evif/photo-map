@@ -4,23 +4,11 @@
 // GPS-coordinate editing, notes, bad-GPS flag, per-photo pin color, rename
 // (with one-level undo), the zoom lightbox, and the resizable sidebar.
 
-import { getExtension } from '../utils.js';
+import { getExtension, formatDate, BROWSER_IMAGE_FORMATS } from '../utils.js';
 import { state, el } from './state.js';
 import { getPhotoMeta, saveMetadata } from './metadata.js';
 import { setMarkerHighlight, placeOrMoveMarker, refreshMarkerPin, resolveColor, resolvePhotoDisplayUrl } from './map.js';
-import { BROWSER_IMAGE_FORMATS } from './state.js';
 import { getFilteredPhotos, renderPhotoList, updateNavButtons } from './photoList.js';
-
-// ─── Date helpers ─────────────────────────────────────────────────────────────
-
-export function formatDate(isoString) {
-  try {
-    return new Date(isoString).toLocaleString(undefined, {
-      year: 'numeric', month: 'long', day: 'numeric',
-      hour: 'numeric', minute: '2-digit'
-    });
-  } catch { return isoString; }
-}
 
 // ─── Info panel open / close ──────────────────────────────────────────────────
 

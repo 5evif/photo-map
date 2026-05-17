@@ -7,7 +7,7 @@
 // Virtual scroll contract: .list-row must be exactly ROW_HEIGHT px tall.
 // The CSS enforces this with `height: 56px; box-sizing: border-box; overflow: hidden`.
 
-import { escapeHtml } from '../utils.js';
+import { escapeHtml, formatDateShort } from '../utils.js';
 import { state, el } from './state.js';
 import { getPhotoMeta } from './metadata.js';
 import { openInfoPanel } from './infoPanel.js';
@@ -21,16 +21,6 @@ const OVERSCAN          = 5;   // extra rows above and below the visible window
 let _allFiltered     = []; // the current filtered photo array
 let _railEl          = null;  // the fixed-height container for virtual rows
 let _scrollBound     = false; // true once the scroll listener is attached
-
-// ─── Date helpers ─────────────────────────────────────────────────────────────
-
-export function formatDateShort(isoString) {
-  try {
-    return new Date(isoString).toLocaleDateString(undefined, {
-      year: 'numeric', month: 'short', day: 'numeric'
-    });
-  } catch { return escapeHtml(String(isoString)); }
-}
 
 // ─── Filter ───────────────────────────────────────────────────────────────────
 
