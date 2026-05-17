@@ -16,9 +16,14 @@ const {
   markdownToHtml,
   isPidRunning,
   sanitizeColor,
+  classifySettingsChange,
+  filterAndSortPhotos,
+  resolveEffectiveCoords,
   SUPPORTED_EXTENSIONS,
   BROWSER_IMAGE_FORMATS
 } = require('../src/utils.js');
+
+const { Worker } = require('worker_threads');
 
 // ─── escapeHtml ───────────────────────────────────────────────────────────────
 
@@ -531,7 +536,7 @@ test('buildCsv: empty metadata object is handled gracefully', () => {
 
 // ─── metadata-io: isValidLabel ────────────────────────────────────────────────
 
-const { isValidLabel, sanitizePhotoMeta, readMetadataFile, writeMetadataFileAtomic } =
+const { isValidLabel, sanitizePhotoMeta, applyMigrations, CURRENT_VERSION, readMetadataFile, writeMetadataFileAtomic } =
   require('../src/main/metadata-io.js');
 
 test('isValidLabel: valid label passes', () => {
@@ -655,7 +660,7 @@ test('readMetadataFile: migrates old absolute keys to in-memory absolute keys', 
 test('readMetadataFile: returns default when file missing', () => {
   withTempDir((dir) => {
     const result = readMetadataFile(dir);
-    assert.equal(result.version, 1);
+    assert.equal(result.version, CURRENT_VERSION);
     assert.equal(result.pinColor, '#4f8ef7');
     assert.deepEqual(result.labels, []);
     assert.deepEqual(result.photos, {});
@@ -694,4 +699,216 @@ test('writeMetadataFileAtomic: no temp file left after success', () => {
     const tmpPath = path.join(dir, 'photo-map-data.json.tmp');
     assert.equal(fs.existsSync(tmpPath), false, '.tmp file must not remain after write');
   });
+});
+
+// ─── applyMigrations / migration runner (D3) ─────────────────────────────────
+
+test('applyMigrations: bumps version 1 to current version', () => {
+  const v1 = { version: 1, pinColor: '#4f8ef7', labels: [], photos: {} };
+  const result = applyMigrations(v1);
+  assert.equal(result.version, CURRENT_VERSION);
+});
+
+test('applyMigrations: does not alter already-current version', () => {
+  const current = { version: CURRENT_VERSION, pinColor: '#4f8ef7', labels: [], photos: {} };
+  const result = applyMigrations(current);
+  assert.equal(result.version, CURRENT_VERSION);
+});
+
+test('applyMigrations: preserves all fields during migration', () => {
+  const v1 = { version: 1, pinColor: '#112233', labels: [{ id: 'x', lat: 1, lng: 2, text: 'hi', size: 'sm' }], photos: { 'a.jpg': { note: 'hi' } } };
+  const result = applyMigrations(v1);
+  assert.equal(result.pinColor, '#112233');
+  assert.deepEqual(result.labels, v1.labels);
+  assert.deepEqual(result.photos, v1.photos);
+});
+
+test('readMetadataFile: migrates v1 file — version field is bumped on read', () => {
+  withTempDir((dir) => {
+    const v1File = { version: 1, pinColor: '#4f8ef7', labels: [], photos: {} };
+    fs.writeFileSync(path.join(dir, 'photo-map-data.json'), JSON.stringify(v1File), 'utf8');
+    const result = readMetadataFile(dir);
+    assert.equal(result.version, CURRENT_VERSION, 'version must be bumped to CURRENT_VERSION');
+  });
+});
+
+test('writeMetadataFileAtomic: writes CURRENT_VERSION to disk', () => {
+  withTempDir((dir) => {
+    writeMetadataFileAtomic(dir, { version: CURRENT_VERSION, pinColor: '#4f8ef7', labels: [], photos: {} });
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, 'photo-map-data.json'), 'utf8'));
+    assert.equal(raw.version, CURRENT_VERSION);
+  });
+});
+
+// ─── Thumbnail worker (5.5) ───────────────────────────────────────────────────
+
+const sharp = require('sharp');
+
+function runThumbnailWorker(filePath, thumbPath) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(
+      path.join(__dirname, '../src/main/thumbnail-worker.js'),
+      { workerData: { filePath, thumbPath } }
+    );
+    worker.on('message', resolve);
+    worker.on('error', reject);
+  });
+}
+
+test('thumbnail worker: generates JPEG from a valid JPEG input', async () => {
+  await withTempDir(async (dir) => {
+    const fixturePath = path.join(dir, 'fixture.jpg');
+    await sharp({
+      create: { width: 20, height: 20, channels: 3, background: { r: 200, g: 100, b: 50 } }
+    }).jpeg({ quality: 80 }).toFile(fixturePath);
+
+    const thumbPath = path.join(dir, 'thumb.jpg');
+    const result = await runThumbnailWorker(fixturePath, thumbPath);
+    assert.equal(result.success, true, 'worker must report success');
+    assert.ok(fs.existsSync(thumbPath), 'thumbnail file must be created on disk');
+  });
+});
+
+test('thumbnail worker: returns failure for a nonexistent file', async () => {
+  await withTempDir(async (dir) => {
+    const result = await runThumbnailWorker(
+      path.join(dir, 'does-not-exist.jpg'),
+      path.join(dir, 'thumb.jpg')
+    );
+    assert.equal(result.success, false);
+    assert.ok(typeof result.error === 'string' && result.error.length > 0, 'error message must be present');
+  });
+});
+
+test('thumbnail worker: returns failure for a corrupted file', async () => {
+  await withTempDir(async (dir) => {
+    const badFile = path.join(dir, 'bad.jpg');
+    fs.writeFileSync(badFile, 'not-an-image-at-all', 'utf8');
+    const result = await runThumbnailWorker(badFile, path.join(dir, 'thumb.jpg'));
+    assert.equal(result.success, false);
+  });
+});
+
+// ─── filterAndSortPhotos (5.6 — photo list filter logic) ─────────────────────
+
+const noMeta     = () => ({});
+const withMeta   = (map) => (fp) => map[fp] || {};
+
+const photos = [
+  { filePath: '/f/c.jpg', filename: 'c.jpg', lat: 1, lng: 1 },
+  { filePath: '/f/a.jpg', filename: 'a.jpg', lat: 2, lng: 2 },
+  { filePath: '/f/b.jpg', filename: 'b.jpg', lat: 3, lng: 3 }
+];
+
+test('filterAndSortPhotos: sorts by filename case-insensitively', () => {
+  const result = filterAndSortPhotos(photos, '', '', noMeta);
+  assert.deepEqual(result.map(p => p.filename), ['a.jpg', 'b.jpg', 'c.jpg']);
+});
+
+test('filterAndSortPhotos: no filter returns all photos', () => {
+  assert.equal(filterAndSortPhotos(photos, '', '', noMeta).length, 3);
+});
+
+test('filterAndSortPhotos: search query filters by filename substring', () => {
+  const result = filterAndSortPhotos(photos, 'b', '', noMeta);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].filename, 'b.jpg');
+});
+
+test('filterAndSortPhotos: listFilter "bad" returns only badGps photos', () => {
+  const meta = withMeta({ '/f/a.jpg': { badGps: true } });
+  const result = filterAndSortPhotos(photos, '', 'bad', meta);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].filename, 'a.jpg');
+});
+
+test('filterAndSortPhotos: listFilter "note" returns only photos with non-empty note', () => {
+  const meta = withMeta({ '/f/c.jpg': { note: 'hello' }, '/f/a.jpg': { note: '  ' } });
+  const result = filterAndSortPhotos(photos, '', 'note', meta);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].filename, 'c.jpg');
+});
+
+test('filterAndSortPhotos: listFilter "override" returns only photos with gpsOverride', () => {
+  const meta = withMeta({ '/f/b.jpg': { gpsOverride: { lat: 10, lng: 20 } } });
+  const result = filterAndSortPhotos(photos, '', 'override', meta);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].filename, 'b.jpg');
+});
+
+test('filterAndSortPhotos: does not mutate input array', () => {
+  const input = [...photos];
+  filterAndSortPhotos(input, '', '', noMeta);
+  assert.deepEqual(input, photos);
+});
+
+// ─── resolveEffectiveCoords (5.6 — marker placement logic) ───────────────────
+
+test('resolveEffectiveCoords: returns null when badGps is true', () => {
+  assert.equal(resolveEffectiveCoords({ badGps: true }, { lat: 10, lng: 20 }), null);
+});
+
+test('resolveEffectiveCoords: returns original coords when no override', () => {
+  const result = resolveEffectiveCoords({}, { lat: 10, lng: 20 });
+  assert.deepEqual(result, { lat: 10, lng: 20 });
+});
+
+test('resolveEffectiveCoords: returns override coords when gpsOverride is set', () => {
+  const result = resolveEffectiveCoords(
+    { gpsOverride: { lat: 55, lng: 37 } },
+    { lat: 10, lng: 20 }
+  );
+  assert.deepEqual(result, { lat: 55, lng: 37 });
+});
+
+test('resolveEffectiveCoords: returns null when no coords available', () => {
+  assert.equal(resolveEffectiveCoords({}, { lat: null, lng: null }), null);
+});
+
+test('resolveEffectiveCoords: returns null when photo has no GPS and no override', () => {
+  assert.equal(resolveEffectiveCoords({}, {}), null);
+});
+
+// ─── classifySettingsChange (scanner.js settings-apply logic) ─────────────────
+
+test('classifySettingsChange: only color changed → color-only', () => {
+  assert.equal(
+    classifySettingsChange({ colorChanged: true, apiKeyChanged: false, folderChanged: false, recursiveChanged: false }),
+    'color-only'
+  );
+});
+
+test('classifySettingsChange: folder changed → full-reload', () => {
+  assert.equal(
+    classifySettingsChange({ colorChanged: false, apiKeyChanged: false, folderChanged: true, recursiveChanged: false }),
+    'full-reload'
+  );
+});
+
+test('classifySettingsChange: api key changed → full-reload', () => {
+  assert.equal(
+    classifySettingsChange({ colorChanged: false, apiKeyChanged: true, folderChanged: false, recursiveChanged: false }),
+    'full-reload'
+  );
+});
+
+test('classifySettingsChange: recursive changed → full-reload', () => {
+  assert.equal(
+    classifySettingsChange({ colorChanged: false, apiKeyChanged: false, folderChanged: false, recursiveChanged: true }),
+    'full-reload'
+  );
+});
+
+test('classifySettingsChange: color + folder changed → full-reload (not color-only)', () => {
+  assert.equal(
+    classifySettingsChange({ colorChanged: true, apiKeyChanged: false, folderChanged: true, recursiveChanged: false }),
+    'full-reload'
+  );
+});
+
+test('classifySettingsChange: nothing changed → full-reload (caller already guards no-op)', () => {
+  assert.equal(
+    classifySettingsChange({ colorChanged: false, apiKeyChanged: false, folderChanged: false, recursiveChanged: false }),
+    'full-reload'
+  );
 });

@@ -7,7 +7,7 @@
 // Virtual scroll contract: .list-row must be exactly ROW_HEIGHT px tall.
 // The CSS enforces this with `height: 56px; box-sizing: border-box; overflow: hidden`.
 
-import { escapeHtml, formatDateShort } from '../utils.js';
+import { escapeHtml, formatDateShort, filterAndSortPhotos } from '../utils.js';
 import { state, el } from './state.js';
 import { getPhotoMeta } from './metadata.js';
 import { openInfoPanel } from './infoPanel.js';
@@ -26,16 +26,7 @@ let _scrollBound     = false; // true once the scroll listener is attached
 
 export function getFilteredPhotos() {
   const query = (el.listSearch.value || '').toLowerCase();
-  return [...state.photos]
-    .sort((a, b) => a.filename.localeCompare(b.filename, undefined, { sensitivity: 'base' }))
-    .filter(photo => {
-      if (query && !photo.filename.toLowerCase().includes(query)) return false;
-      const pm = getPhotoMeta(photo.filePath);
-      if (state.listFilter === 'bad'      && !pm.badGps)        return false;
-      if (state.listFilter === 'note'     && !pm.note?.trim())   return false;
-      if (state.listFilter === 'override' && !pm.gpsOverride)    return false;
-      return true;
-    });
+  return filterAndSortPhotos(state.photos, query, state.listFilter, getPhotoMeta);
 }
 
 // ─── Row builder ──────────────────────────────────────────────────────────────
@@ -154,6 +145,23 @@ export function applyMarkerFilter(visiblePaths) {
     if (shouldShow && !isOnMap)  entry.marker.addTo(state.map);
     if (!shouldShow && isOnMap)  entry.marker.remove();
   }
+}
+
+// Called once by renderer.js during bindAppEvents().
+export function registerPhotoListEvents() {
+  let _searchTimer = null;
+  el.listSearch.addEventListener('input', () => {
+    clearTimeout(_searchTimer);
+    _searchTimer = setTimeout(renderPhotoList, 150);
+  });
+  document.querySelectorAll('.btn-filter').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.btn-filter').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      state.listFilter = btn.dataset.filter;
+      renderPhotoList();
+    });
+  });
 }
 
 export function updateNavButtons() {

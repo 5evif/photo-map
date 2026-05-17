@@ -151,6 +151,63 @@ const SUPPORTED_EXTENSIONS = new Set([
 // Formats the browser (Chromium) can decode directly — no thumbnail needed.
 const BROWSER_IMAGE_FORMATS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.avif']);
 
+// ─── Settings ─────────────────────────────────────────────────────────────────
+
+/**
+ * Classifies a settings-save event into the minimum work needed.
+ * Pure function — used by applyNewSettings in scanner.js.
+ *
+ * Input:  flags — { apiKeyChanged, folderChanged, recursiveChanged, colorChanged }
+ * Returns: 'color-only' | 'full-reload'
+ */
+function classifySettingsChange({ apiKeyChanged, folderChanged, recursiveChanged, colorChanged }) {
+  if (colorChanged && !apiKeyChanged && !folderChanged && !recursiveChanged) return 'color-only';
+  return 'full-reload';
+}
+
+// ─── Renderer business logic (pure, no DOM dependency) ───────────────────────
+
+/**
+ * Filters and sorts a photo array by filename, search query, and list filter.
+ * Pure function — no DOM or state dependencies.
+ *
+ * Input:
+ *   photos     — array of photo objects with { filePath, filename } at minimum
+ *   query      — lowercase search string ('' means no text filter)
+ *   listFilter — '' | 'bad' | 'note' | 'override'
+ *   getMetaFn  — (filePath) => { badGps, note, gpsOverride } photo-metadata getter
+ * Returns: filtered, sorted array (new array, input is not mutated)
+ */
+function filterAndSortPhotos(photos, query, listFilter, getMetaFn) {
+  return [...photos]
+    .sort((a, b) => a.filename.localeCompare(b.filename, undefined, { sensitivity: 'base' }))
+    .filter(photo => {
+      if (query && !photo.filename.toLowerCase().includes(query)) return false;
+      const pm = getMetaFn(photo.filePath);
+      if (listFilter === 'bad'      && !pm.badGps)        return false;
+      if (listFilter === 'note'     && !pm.note?.trim())   return false;
+      if (listFilter === 'override' && !pm.gpsOverride)    return false;
+      return true;
+    });
+}
+
+/**
+ * Resolves the effective map coordinates for a photo, taking GPS override and
+ * badGps flag into account.
+ *
+ * Input:
+ *   pm    — photo-metadata object { badGps, gpsOverride: { lat, lng } | null }
+ *   photo — raw photo data object { lat, lng, … }
+ * Returns: { lat, lng } to use for map placement, or null if the photo should
+ *          not appear on the map (flagged bad, or no usable coordinates).
+ */
+function resolveEffectiveCoords(pm, photo) {
+  if (pm.badGps) return null;
+  const lat = pm.gpsOverride ? pm.gpsOverride.lat : photo.lat;
+  const lng = pm.gpsOverride ? pm.gpsOverride.lng : photo.lng;
+  return (lat != null && lng != null) ? { lat, lng } : null;
+}
+
 // ─── Color Sanitization ───────────────────────────────────────────────────────
 
 /**
@@ -176,6 +233,9 @@ module.exports = {
   markdownToHtml,
   isPidRunning,
   sanitizeColor,
+  classifySettingsChange,
+  filterAndSortPhotos,
+  resolveEffectiveCoords,
   SUPPORTED_EXTENSIONS,
   BROWSER_IMAGE_FORMATS
 };

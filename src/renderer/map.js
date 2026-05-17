@@ -5,7 +5,7 @@
 // handle their own follow-up UI updates.
 
 import L from 'leaflet';
-import { sanitizeColor, BROWSER_IMAGE_FORMATS } from '../utils.js';
+import { sanitizeColor, BROWSER_IMAGE_FORMATS, resolveEffectiveCoords } from '../utils.js';
 import { state, el, setStatus, MAPTILER_ATTRIBUTION } from './state.js';
 import { getPhotoMeta } from './metadata.js';
 import { openInfoPanel } from './infoPanel.js';
@@ -252,23 +252,16 @@ export function placeOrMoveMarker(entry, lat, lng) {
 }
 
 export function createPhotoMarker(photoData) {
-  const pm    = getPhotoMeta(photoData.filePath);
-  const isBad = pm.badGps === true;
+  const pm     = getPhotoMeta(photoData.filePath);
+  const coords = resolveEffectiveCoords(pm, photoData);
 
-  if (isBad) {
-    state.markers.push({ marker: null, data: photoData, onMap: false });
-    return;
-  }
-
-  const effLat = pm.gpsOverride ? pm.gpsOverride.lat : photoData.lat;
-  const effLng = pm.gpsOverride ? pm.gpsOverride.lng : photoData.lng;
-  if (effLat == null || effLng == null) {
+  if (!coords) {
     state.markers.push({ marker: null, data: photoData, onMap: false });
     return;
   }
 
   const marker = L.marker(
-    [effLat, effLng],
+    [coords.lat, coords.lng],
     { icon: createPinIcon(resolveColor(photoData.filePath)), title: photoData.filename }
   );
   marker.on('click', () => openInfoPanel(photoData));
@@ -285,18 +278,14 @@ export function refreshMarkerPin(filePath) {
   const entry = state.markers.find(m => m.data.filePath === filePath);
   if (!entry) return;
 
-  const pm    = getPhotoMeta(filePath);
-  const isBad = pm.badGps === true;
+  const pm     = getPhotoMeta(filePath);
+  const coords = resolveEffectiveCoords(pm, entry.data);
 
-  if (isBad) {
+  if (!coords) {
     if (entry.marker && entry.onMap) { entry.marker.remove(); entry.onMap = false; }
   } else {
-    const effLat = pm.gpsOverride ? pm.gpsOverride.lat : entry.data.lat;
-    const effLng = pm.gpsOverride ? pm.gpsOverride.lng : entry.data.lng;
-    if (effLat != null && effLng != null) {
-      placeOrMoveMarker(entry, effLat, effLng);
-      if (state.activePhoto?.filePath === filePath) setMarkerHighlight(filePath, true);
-    }
+    placeOrMoveMarker(entry, coords.lat, coords.lng);
+    if (state.activePhoto?.filePath === filePath) setMarkerHighlight(filePath, true);
   }
 }
 
