@@ -3,7 +3,7 @@
 // Settings overlay (API key, folder, recursive scan, pin color, label toggle),
 // GeoJSON/CSV export, and the README viewer overlay.
 
-import { escapeHtml, markdownToHtml } from '../utils.js';
+import { escapeHtml, markdownToHtml, DEFAULT_PIN_COLOR } from '../utils.js';
 import { state, el } from './state.js';
 import { saveMetadata } from './metadata.js';
 import { setLabelsVisibility } from './labels.js';
@@ -43,7 +43,7 @@ export async function handleSaveSettings(onSettingsChanged) {
   const apiKeyUnchanged    = newApiKey    === state.apiKey;
   const folderUnchanged    = newFolder    === state.folderPath;
   const recursiveUnchanged = newRecursive === state.recursive;
-  const storedColor        = (state.meta.pinColor || state.pinColor || '#4f8ef7').toLowerCase();
+  const storedColor        = (state.meta.pinColor || state.pinColor || DEFAULT_PIN_COLOR).toLowerCase();
   const colorUnchanged     = newPinColor.toLowerCase() === storedColor;
 
   if (apiKeyUnchanged && folderUnchanged && recursiveUnchanged && colorUnchanged) {

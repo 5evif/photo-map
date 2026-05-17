@@ -5,8 +5,8 @@
 // Extracted from renderer.js so the orchestrator stays focused on screen
 // switching and top-level event wiring.
 
-import { formatLockTimestamp, classifySettingsChange } from '../utils.js';
-import { state, el, setStatus }                       from './state.js';
+import { formatLockTimestamp, classifySettingsChange, DEFAULT_PIN_COLOR } from '../utils.js';
+import { state, el, setStatus, CURRENT_METADATA_VERSION }               from './state.js';
 import { loadMetadata, saveMetadata, getPhotoMeta }    from './metadata.js';
 import {
   placePhotoMarkers, createPhotoMarker, clearPhotoMarkers,
@@ -131,7 +131,7 @@ export async function applyNewSettings({ newApiKey, newFolder, newRecursive, new
   clearAllLabels();
   state.photos      = [];
   state.activePhoto = null;
-  state.meta        = { version: 2, pinColor: '#4f8ef7', labels: [], photos: {} };
+  state.meta        = { version: CURRENT_METADATA_VERSION, pinColor: DEFAULT_PIN_COLOR, labels: [], photos: {} };
   closeInfoPanel();
   setFolderName(newFolder);
   renderPhotoList();

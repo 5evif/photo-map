@@ -5,7 +5,7 @@
 // handle their own follow-up UI updates.
 
 import L from 'leaflet';
-import { sanitizeColor, BROWSER_IMAGE_FORMATS, resolveEffectiveCoords } from '../utils.js';
+import { sanitizeColor, BROWSER_IMAGE_FORMATS, resolveEffectiveCoords, DEFAULT_PIN_COLOR } from '../utils.js';
 import { state, el, setStatus, MAPTILER_ATTRIBUTION } from './state.js';
 import { getPhotoMeta } from './metadata.js';
 import { openInfoPanel } from './infoPanel.js';
@@ -204,7 +204,7 @@ function addAddressSearch() {
 
 export function resolveColor(filePath) {
   const pm  = state.meta.photos[filePath];
-  const raw = (pm && pm.pinColor) || state.meta.pinColor || state.pinColor || '#4f8ef7';
+  const raw = (pm && pm.pinColor) || state.meta.pinColor || state.pinColor || DEFAULT_PIN_COLOR;
   return sanitizeColor(raw);
 }
 

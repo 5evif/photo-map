@@ -210,6 +210,11 @@ function resolveEffectiveCoords(pm, photo) {
 
 // ─── Color Sanitization ───────────────────────────────────────────────────────
 
+// Default pin color — shared by renderer modules and utils fallbacks.
+// The main process uses its own local copy in metadata-io.js since it cannot
+// require() this file (CommonJS/ESM boundary in production build).
+const DEFAULT_PIN_COLOR = '#4f8ef7';
+
 /**
  * Validates a color string is a safe hex value before use in style attributes.
  * Only accepts #rgb, #rrggbb, and #rrggbbaa — the formats produced by
@@ -218,7 +223,7 @@ function resolveEffectiveCoords(pm, photo) {
  */
 function sanitizeColor(color) {
   if (typeof color === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(color)) return color;
-  return '#4f8ef7';
+  return DEFAULT_PIN_COLOR;
 }
 
 // ─── Exports ──────────────────────────────────────────────────────────────────
@@ -237,5 +242,6 @@ module.exports = {
   filterAndSortPhotos,
   resolveEffectiveCoords,
   SUPPORTED_EXTENSIONS,
-  BROWSER_IMAGE_FORMATS
+  BROWSER_IMAGE_FORMATS,
+  DEFAULT_PIN_COLOR
 };

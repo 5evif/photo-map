@@ -21,6 +21,7 @@
  */
 
 import 'leaflet/dist/leaflet.css';
+import { DEFAULT_PIN_COLOR }                     from '../utils.js';
 import { state, el, qrEl, setStatus }           from './state.js';
 import { loadMetadata }                          from './metadata.js';
 import { launchMap }                             from './map.js';
@@ -42,7 +43,7 @@ async function init() {
   state.folderPath   = settings.folderPath  || '';
   state.recursive    = settings.recursive   !== false;
   state.sidebarWidth = settings.sidebarWidth || 340;
-  state.pinColor     = settings.pinColor    || '#4f8ef7';
+  state.pinColor     = settings.pinColor    || DEFAULT_PIN_COLOR;
 
   applySidebarWidth(state.sidebarWidth);
 
