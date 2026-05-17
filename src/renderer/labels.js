@@ -14,6 +14,13 @@ export function renderAllLabels() {
   }
 }
 
+// Removes all label markers from the map and clears the tracking array.
+// Called on folder change before renderAllLabels() loads the new folder's labels.
+export function clearAllLabels() {
+  for (const { marker } of state.labelMarkers) marker.remove();
+  state.labelMarkers = [];
+}
+
 export function createLabelMarker(labelData) {
   const fontSize = LABEL_FONT_SIZES[labelData.size] || '16px';
   const icon = L.divIcon({

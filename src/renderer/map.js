@@ -84,6 +84,26 @@ export function launchMap(callbacks) {
   });
 }
 
+// Updates the MapTiler API key in the tile layer URLs without reinitialising
+// the map — called when the user changes only the API key in Settings.
+export function updateTileApiKey(newKey) {
+  state.satelliteLayer?.setUrl(
+    `https://api.maptiler.com/maps/satellite/{z}/{x}/{y}.jpg?key=${newKey}`
+  );
+  state.streetsLayer?.setUrl(
+    `https://api.maptiler.com/maps/openstreetmap/{z}/{x}/{y}.png?key=${newKey}`
+  );
+}
+
+// Re-colours every on-map marker pin to reflect the current global/per-photo
+// pin color.  Called when the user changes the global pin color in Settings.
+export function refreshAllMarkerPins() {
+  for (const entry of state.markers) {
+    if (!entry.marker) continue;
+    entry.marker.setIcon(createPinIcon(resolveColor(entry.data.filePath)));
+  }
+}
+
 // ─── Address geocoding search control ─────────────────────────────────────────
 
 function addAddressSearch() {
