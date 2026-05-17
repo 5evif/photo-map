@@ -1,18 +1,36 @@
 /*
  * utils.js — Shared Pure Utility Functions
  *
- * All exports are pure functions with no side effects and no external
- * dependencies (no Electron, no DOM, no file I/O).  This makes them
- * trivially testable with node:test without any mocking.
+ * All exports are pure functions with no side effects.
  *
  * Used by:
  *   src/main/main.js         — isPidRunning, csvEscape, SUPPORTED_EXTENSIONS
- *   src/renderer/renderer.js — escapeHtml, getExtension, formatLockTimestamp,
- *                              markdownToHtml, sanitizeColor (via Vite bundle)
+ *   src/renderer/settings.js — markdownToHtml, escapeHtml (via Vite bundle)
  *   tests/unit.test.js       — all exports
  */
 
 'use strict';
+
+const { marked } = require('marked');
+
+// Block dangerous URL schemes in links — only http/https/mailto are allowed.
+// Safe inline formatting tags that marked may emit inside link text.
+const _SAFE_INLINE = /^\/?(strong|em|code|del|s|br|b|i|u)$/i;
+
+marked.use({
+  renderer: {
+    link({ href, title, text }) {
+      const safe = /^(https?:|mailto:)/i.test(href || '') ? href : '#';
+      const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+      // Escape any HTML tag in link text that isn't a whitelisted inline element
+      // so that <script>, <img onerror=…>, etc. can't inject via link text.
+      const safeText = text.replace(/<(\/?)([a-z][a-z0-9]*)[^>]*>/gi, (match, slash, tag) =>
+        _SAFE_INLINE.test(slash + tag) ? match : escapeHtml(match)
+      );
+      return `<a href="${safe}"${titleAttr} target="_blank" rel="noopener noreferrer">${safeText}</a>`;
+    }
+  }
+});
 
 // ─── Text / HTML ───────────────────────────────────────────────────────────────
 
@@ -65,195 +83,16 @@ function csvEscape(v) {
 // ─── Markdown ─────────────────────────────────────────────────────────────────
 
 /**
- * Converts a limited subset of Markdown to safe HTML.
- * Supports: h1–h3, paragraphs, blockquotes, bullet/ordered lists, fenced code
- * blocks, inline code, bold, links (http/https/mailto only), horizontal rules,
- * and tables.
- *
- * All user content is run through escapeHtml before output — this function
- * is safe to use with untrusted input.
- *
- * This implementation is kept in sync with the identical copy in renderer.js,
- * which cannot use require(). Update both files together.
+ * Converts Markdown to HTML using the `marked` library.
+ * Links are sanitised by the custom renderer above: only http/https/mailto
+ * URLs are preserved; everything else (javascript:, data:, etc.) is replaced
+ * with "#" so this function is safe to use with untrusted input.
  *
  * Input:  md — a Markdown string
  * Returns: an HTML string safe to set as innerHTML
  */
 function markdownToHtml(md) {
-  const lines = md.split('\n');
-  const out   = [];
-  let inCodeBlock   = false;
-  let inList        = false;
-  let inOrderedList = false;
-  let inTable       = false;
-  let tableLines    = [];
-  let codeLang      = '';
-  let codeLines     = [];
-
-  function inlineFormat(raw) {
-    let result = '';
-    let i = 0;
-    let textStart = 0;
-
-    function flushPlain(end) {
-      if (end > textStart) result += escapeHtml(raw.slice(textStart, end));
-      textStart = end;
-    }
-
-    while (i < raw.length) {
-      // Inline code: `text`
-      if (raw[i] === '`') {
-        const end = raw.indexOf('`', i + 1);
-        if (end !== -1) {
-          flushPlain(i);
-          result += `<code class="md-inline-code">${escapeHtml(raw.slice(i + 1, end))}</code>`;
-          i = end + 1; textStart = i; continue;
-        }
-      }
-      // Link: [text](url)
-      if (raw[i] === '[') {
-        const cb = raw.indexOf(']', i + 1);
-        if (cb !== -1 && raw[cb + 1] === '(') {
-          const cp = raw.indexOf(')', cb + 2);
-          if (cp !== -1) {
-            flushPlain(i);
-            const linkText = raw.slice(i + 1, cb);
-            const url      = raw.slice(cb + 2, cp);
-            const safeUrl  = /^https?:|^mailto:/i.test(url) ? url : '#';
-            result += `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(linkText)}</a>`;
-            i = cp + 1; textStart = i; continue;
-          }
-        }
-      }
-      // Bold: **text**
-      if (raw[i] === '*' && raw[i + 1] === '*') {
-        const end = raw.indexOf('**', i + 2);
-        if (end !== -1) {
-          flushPlain(i);
-          result += `<strong>${escapeHtml(raw.slice(i + 2, end))}</strong>`;
-          i = end + 2; textStart = i; continue;
-        }
-      }
-      i++;
-    }
-    flushPlain(i);
-    return result;
-  }
-
-  function flushList() {
-    if (inList)        { out.push('</ul>'); inList        = false; }
-    if (inOrderedList) { out.push('</ol>'); inOrderedList = false; }
-  }
-
-  function flushTable() {
-    if (!inTable) return;
-    inTable = false;
-    const rows = tableLines;
-    tableLines = [];
-    if (rows.length < 2) {
-      rows.forEach(r => out.push(`<p class="md-p">${inlineFormat(r)}</p>`));
-      return;
-    }
-    const parseRow = line => line.split('|').slice(1, -1).map(c => c.trim());
-    const isSep    = cells => cells.length > 0 && cells.every(c => /^[-: ]+$/.test(c));
-    const headers  = parseRow(rows[0]);
-    if (!isSep(parseRow(rows[1]))) {
-      rows.forEach(r => out.push(`<p class="md-p">${inlineFormat(r)}</p>`));
-      return;
-    }
-    let html = '<table class="md-table"><thead><tr>';
-    headers.forEach(c => { html += `<th class="md-th">${inlineFormat(c)}</th>`; });
-    html += '</tr></thead><tbody>';
-    for (let j = 2; j < rows.length; j++) {
-      html += '<tr>';
-      parseRow(rows[j]).forEach(c => { html += `<td class="md-td">${inlineFormat(c)}</td>`; });
-      html += '</tr>';
-    }
-    html += '</tbody></table>';
-    out.push(html);
-  }
-
-  for (let i = 0; i < lines.length; i++) {
-    const raw  = lines[i];
-    const line = raw.trimEnd();
-
-    // ── Fenced code block ──────────────────────────────────────────────────
-    if (line.startsWith('```')) {
-      if (!inCodeBlock) {
-        flushList(); flushTable();
-        inCodeBlock = true;
-        codeLang    = line.slice(3).trim();
-        codeLines   = [];
-      } else {
-        const escaped  = codeLines.map(l => escapeHtml(l)).join('\n');
-        const langAttr = codeLang ? ` class="md-code-lang-${escapeHtml(codeLang)}"` : '';
-        out.push(`<pre class="md-code-block"><code${langAttr}>${escaped}</code></pre>`);
-        inCodeBlock = false; codeLines = []; codeLang = '';
-      }
-      continue;
-    }
-    if (inCodeBlock) { codeLines.push(raw); continue; }
-
-    // ── Blank line ─────────────────────────────────────────────────────────
-    if (!line.trim()) { flushList(); flushTable(); continue; }
-
-    // ── Table row ──────────────────────────────────────────────────────────
-    if (line.trimStart().startsWith('|')) {
-      flushList();
-      inTable = true;
-      tableLines.push(line);
-      continue;
-    }
-    flushTable();
-
-    // ── Headings ───────────────────────────────────────────────────────────
-    const h3 = line.match(/^### (.+)/);
-    const h2 = line.match(/^## (.+)/);
-    const h1 = line.match(/^# (.+)/);
-    if (h1) { flushList(); out.push(`<h1 class="md-h1">${inlineFormat(h1[1])}</h1>`); continue; }
-    if (h2) { flushList(); out.push(`<h2 class="md-h2">${inlineFormat(h2[1])}</h2>`); continue; }
-    if (h3) { flushList(); out.push(`<h3 class="md-h3">${inlineFormat(h3[1])}</h3>`); continue; }
-
-    // ── Horizontal rule ────────────────────────────────────────────────────
-    if (/^---+$/.test(line.trim())) { flushList(); out.push('<hr class="md-hr"/>'); continue; }
-
-    // ── Blockquote ─────────────────────────────────────────────────────────
-    const bq = line.match(/^> (.+)/);
-    if (bq) {
-      flushList();
-      out.push(`<blockquote class="md-blockquote">${inlineFormat(bq[1])}</blockquote>`);
-      continue;
-    }
-
-    // ── Unordered list ─────────────────────────────────────────────────────
-    const li = line.match(/^[-*] (.+)/);
-    if (li) {
-      if (inOrderedList) { out.push('</ol>'); inOrderedList = false; }
-      if (!inList) { out.push('<ul class="md-ul">'); inList = true; }
-      out.push(`<li class="md-li">${inlineFormat(li[1])}</li>`);
-      continue;
-    }
-
-    // ── Ordered list ───────────────────────────────────────────────────────
-    const oli = line.match(/^\d+\. (.+)/);
-    if (oli) {
-      if (inList) { out.push('</ul>'); inList = false; }
-      if (!inOrderedList) { out.push('<ol class="md-ol">'); inOrderedList = true; }
-      out.push(`<li class="md-li">${inlineFormat(oli[1])}</li>`);
-      continue;
-    }
-
-    // ── Paragraph ──────────────────────────────────────────────────────────
-    flushList();
-    out.push(`<p class="md-p">${inlineFormat(line)}</p>`);
-  }
-
-  flushList();
-  flushTable();
-  if (inCodeBlock && codeLines.length) {
-    out.push(`<pre class="md-code-block"><code>${codeLines.map(l => escapeHtml(l)).join('\n')}</code></pre>`);
-  }
-  return out.join('\n');
+  return marked.parse(md);
 }
 
 // ─── Process / OS ─────────────────────────────────────────────────────────────
