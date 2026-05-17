@@ -145,7 +145,7 @@ function createWindow() {
     backgroundColor: '#1a1a2e'
   });
 
-  mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+  mainWindow.loadFile(path.join(__dirname, '..', '..', 'dist-renderer', 'index.html'));
 
   // Redirect any navigation away from the local app file to the system browser.
   // Without this, clicking an <a href="https://..."> in the renderer replaces the

@@ -27,8 +27,8 @@
         "browser": true,
         "node": false
       },
-      "globals": {
-        "L": "readonly"
+      "parserOptions": {
+        "sourceType": "module"
       }
     }
   ]

@@ -6,13 +6,10 @@
  * trivially testable with node:test without any mocking.
  *
  * Used by:
- *   src/main/main.js   — isPidRunning, csvEscape, SUPPORTED_EXTENSIONS
- *   tests/unit.test.js — all exports
- *
- * Note: renderer.js defines its own copies of escapeHtml, getExtension,
- * formatLockTimestamp, and markdownToHtml because it runs in a browser
- * context where require() is not available.  Keep those copies in sync
- * with the canonical implementations below.
+ *   src/main/main.js         — isPidRunning, csvEscape, SUPPORTED_EXTENSIONS
+ *   src/renderer/renderer.js — escapeHtml, getExtension, formatLockTimestamp,
+ *                              markdownToHtml, sanitizeColor (via Vite bundle)
+ *   tests/unit.test.js       — all exports
  */
 
 'use strict';
