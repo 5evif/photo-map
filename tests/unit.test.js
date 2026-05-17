@@ -2,6 +2,9 @@
 
 const { test } = require('node:test');
 const assert   = require('node:assert/strict');
+const fs       = require('fs');
+const os       = require('os');
+const path     = require('path');
 
 const {
   escapeHtml,
@@ -230,4 +233,171 @@ test('SUPPORTED_EXTENSIONS: does not contain non-photo extensions', () => {
   assert.equal(SUPPORTED_EXTENSIONS.has('.txt'), false);
   assert.equal(SUPPORTED_EXTENSIONS.has('.mp4'), false);
   assert.equal(SUPPORTED_EXTENSIONS.has('.pdf'), false);
+});
+
+// ─── metadata-io: isValidLabel ────────────────────────────────────────────────
+
+const { isValidLabel, sanitizePhotoMeta, readMetadataFile, writeMetadataFileAtomic } =
+  require('../src/main/metadata-io.js');
+
+test('isValidLabel: valid label passes', () => {
+  assert.equal(isValidLabel({ id: 'a', lat: 51.5, lng: -0.1, text: 'London', size: 'medium' }), true);
+});
+
+test('isValidLabel: missing id fails', () => {
+  assert.equal(isValidLabel({ lat: 51.5, lng: -0.1, text: 'x', size: 'small' }), false);
+});
+
+test('isValidLabel: lat out of range fails', () => {
+  assert.equal(isValidLabel({ id: 'a', lat: 91, lng: 0, text: 'x', size: 'small' }), false);
+});
+
+test('isValidLabel: lng out of range fails', () => {
+  assert.equal(isValidLabel({ id: 'a', lat: 0, lng: 181, text: 'x', size: 'small' }), false);
+});
+
+test('isValidLabel: non-finite lat fails', () => {
+  assert.equal(isValidLabel({ id: 'a', lat: NaN, lng: 0, text: 'x', size: 'small' }), false);
+});
+
+test('isValidLabel: null fails', () => {
+  assert.equal(isValidLabel(null), false);
+});
+
+// ─── metadata-io: sanitizePhotoMeta ──────────────────────────────────────────
+
+test('sanitizePhotoMeta: valid full entry returns sanitised copy', () => {
+  const out = sanitizePhotoMeta({
+    note: 'hi', badGps: true, pinColor: '#ff0000', gpsOverride: { lat: 1, lng: 2 }
+  });
+  assert.deepEqual(out, { note: 'hi', badGps: true, pinColor: '#ff0000', gpsOverride: { lat: 1, lng: 2 } });
+});
+
+test('sanitizePhotoMeta: strips unknown keys', () => {
+  const out = sanitizePhotoMeta({ note: 'ok', injected: 'evil', __proto__: {} });
+  assert.ok(!('injected' in out), 'unknown key must be stripped');
+});
+
+test('sanitizePhotoMeta: invalid pinColor is excluded', () => {
+  const out = sanitizePhotoMeta({ pinColor: 'red; background: evil' });
+  assert.ok(!('pinColor' in out), 'invalid pinColor must be excluded');
+});
+
+test('sanitizePhotoMeta: null pinColor is preserved', () => {
+  const out = sanitizePhotoMeta({ pinColor: null });
+  assert.equal(out.pinColor, null);
+});
+
+test('sanitizePhotoMeta: invalid gpsOverride is excluded', () => {
+  const out = sanitizePhotoMeta({ gpsOverride: { lat: NaN, lng: 0 } });
+  assert.ok(!('gpsOverride' in out), 'gpsOverride with NaN lat must be excluded');
+});
+
+test('sanitizePhotoMeta: null returns null', () => {
+  assert.equal(sanitizePhotoMeta(null), null);
+});
+
+test('sanitizePhotoMeta: non-object returns null', () => {
+  assert.equal(sanitizePhotoMeta('string'), null);
+});
+
+// ─── metadata-io: round-trip and migration ───────────────────────────────────
+
+function withTempDir(fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'photo-map-test-'));
+  try { return fn(dir); }
+  finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+test('writeMetadataFileAtomic + readMetadataFile: round-trip preserves data', () => {
+  withTempDir((dir) => {
+    const absPhoto = path.join(dir, 'IMG_001.jpg');
+    const metadata = {
+      version: 1, pinColor: '#4f8ef7', labels: [],
+      photos: { [absPhoto]: { note: 'test note', badGps: false, pinColor: null, gpsOverride: null } }
+    };
+    const writeResult = writeMetadataFileAtomic(dir, metadata);
+    assert.equal(writeResult.success, true);
+
+    const read = readMetadataFile(dir);
+    assert.equal(read.photos[absPhoto].note, 'test note');
+    assert.equal(read.photos[absPhoto].badGps, false);
+  });
+});
+
+test('writeMetadataFileAtomic: keys stored as relative paths on disk', () => {
+  withTempDir((dir) => {
+    const absPhoto = path.join(dir, 'sub', 'IMG_002.jpg');
+    writeMetadataFileAtomic(dir, {
+      version: 1, pinColor: '#4f8ef7', labels: [],
+      photos: { [absPhoto]: { note: 'sub' } }
+    });
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, 'photo-map-data.json'), 'utf8'));
+    const keys = Object.keys(raw.photos);
+    assert.equal(keys.length, 1);
+    assert.ok(!path.isAbsolute(keys[0]), 'disk key must be relative');
+    // Forward slashes on all platforms
+    assert.ok(!keys[0].includes('\\'), 'disk key must use forward slashes');
+    assert.equal(keys[0], 'sub/IMG_002.jpg');
+  });
+});
+
+test('readMetadataFile: migrates old absolute keys to in-memory absolute keys', () => {
+  withTempDir((dir) => {
+    const absPhoto = path.join(dir, 'IMG_003.jpg');
+    // Write old-format file with absolute keys directly
+    const oldFormat = {
+      version: 1, pinColor: '#4f8ef7', labels: [],
+      photos: { [absPhoto]: { note: 'migrated', badGps: true } }
+    };
+    fs.writeFileSync(path.join(dir, 'photo-map-data.json'), JSON.stringify(oldFormat), 'utf8');
+
+    const read = readMetadataFile(dir);
+    assert.equal(read.photos[absPhoto].note, 'migrated');
+    assert.equal(read.photos[absPhoto].badGps, true);
+  });
+});
+
+test('readMetadataFile: returns default when file missing', () => {
+  withTempDir((dir) => {
+    const result = readMetadataFile(dir);
+    assert.equal(result.version, 1);
+    assert.equal(result.pinColor, '#4f8ef7');
+    assert.deepEqual(result.labels, []);
+    assert.deepEqual(result.photos, {});
+  });
+});
+
+test('readMetadataFile: returns default when file is corrupt JSON', () => {
+  withTempDir((dir) => {
+    fs.writeFileSync(path.join(dir, 'photo-map-data.json'), 'NOT JSON', 'utf8');
+    const result = readMetadataFile(dir);
+    assert.deepEqual(result.photos, {});
+  });
+});
+
+test('readMetadataFile: strips invalid labels', () => {
+  withTempDir((dir) => {
+    const data = {
+      version: 1, pinColor: '#4f8ef7',
+      labels: [
+        { id: 'good', lat: 10, lng: 20, text: 'ok', size: 'small' },
+        { id: 'bad',  lat: 999, lng: 20, text: 'out-of-range', size: 'small' },
+        'not-an-object'
+      ],
+      photos: {}
+    };
+    fs.writeFileSync(path.join(dir, 'photo-map-data.json'), JSON.stringify(data), 'utf8');
+    const result = readMetadataFile(dir);
+    assert.equal(result.labels.length, 1);
+    assert.equal(result.labels[0].id, 'good');
+  });
+});
+
+test('writeMetadataFileAtomic: no temp file left after success', () => {
+  withTempDir((dir) => {
+    writeMetadataFileAtomic(dir, { version: 1, pinColor: '#4f8ef7', labels: [], photos: {} });
+    const tmpPath = path.join(dir, 'photo-map-data.json.tmp');
+    assert.equal(fs.existsSync(tmpPath), false, '.tmp file must not remain after write');
+  });
 });
