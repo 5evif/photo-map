@@ -73,6 +73,7 @@ const Store  = require('electron-store');
 const chokidar = require('chokidar');
 const exifr    = require('exifr');  // reads GPS and date from photo EXIF metadata
 const { isPidRunning, csvEscape, SUPPORTED_EXTENSIONS } = require('../utils.js');
+const { METADATA_FILENAME, readMetadataFile, writeMetadataFileAtomic } = require('./metadata-io.js');
 
 // ─── App-wide state ────────────────────────────────────────────────────────────
 
@@ -92,9 +93,6 @@ const store = new Store({
 const THUMBNAIL_CACHE_DIR      = path.join(app.getPath('userData'), 'thumbnails');
 const GPS_CACHE_FILE           = path.join(app.getPath('userData'), 'gps-cache.json');
 const THUMBNAIL_CACHE_MAX_BYTES = 500 * 1024 * 1024; // 500 MB — evict oldest thumbnails beyond this
-
-// This file lives inside the user's photo folder so data travels with the photos.
-const METADATA_FILENAME = 'photo-map-data.json';
 
 // The lock file sits next to the metadata file. Its presence means someone else
 // currently has this folder open and is editing annotations. We create it when
@@ -184,59 +182,6 @@ function loadGpsCache() {
 function saveGpsCache(cache) {
   try { fs.writeFileSync(GPS_CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8'); }
   catch (err) { console.error('Could not save GPS cache:', err.message); }
-}
-
-// ─── Per-Folder Metadata File ──────────────────────────────────────────────────
-
-/*
- * Returns the full path to the metadata file inside the photo folder.
- * Example: "/Users/sara/Trips/photo-map-data.json"
- */
-function metadataFilePath(folderPath) {
-  return path.join(folderPath, METADATA_FILENAME);
-}
-
-/*
- * Reads the metadata file from the given photo folder.
- * Returns a fresh empty object if the file doesn't exist yet.
- *
- * The metadata shape is:
- * {
- *   version: 1,
- *   pinColor: "#4f8ef7",      ← global default pin color
- *   labels: [ { id, lat, lng, text, size }, … ],
- *   photos: {
- *     "/full/path/to/photo.jpg": {
- *       note:     "string or empty",
- *       badGps:   true/false,
- *       pinColor: "#rrggbb or null to use global"
- *     },
- *     …
- *   }
- * }
- */
-function readMetadata(folderPath) {
-  try {
-    const fp = metadataFilePath(folderPath);
-    if (fs.existsSync(fp))
-      return JSON.parse(fs.readFileSync(fp, 'utf8'));
-  } catch (err) { console.error('Could not read metadata:', err.message); }
-  return { version: 1, pinColor: '#4f8ef7', labels: [], photos: {} };
-}
-
-/*
- * Writes the metadata object to photo-map-data.json in the photo folder.
- * Input: folderPath — the photo folder
- *        metadata   — the complete metadata object to save
- * Returns: { success: true } or { success: false, error }
- */
-function writeMetadata(folderPath, metadata) {
-  try {
-    fs.writeFileSync(metadataFilePath(folderPath), JSON.stringify(metadata, null, 2), 'utf8');
-    return { success: true };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
 }
 
 // ─── Lock File Management ─────────────────────────────────────────────────────
@@ -781,17 +726,19 @@ ipcMain.handle('stop-watching', () => {
 /*
  * Reads photo-map-data.json from the given photo folder.
  * Input: folderPath string
- * Returns: metadata object (never null — returns empty structure if file missing)
+ * Returns: metadata object with absolute-path keys (never null — falls back to empty structure)
  */
-ipcMain.handle('read-metadata', (event, folderPath) => readMetadata(folderPath));
+ipcMain.handle('read-metadata', (event, folderPath) => readMetadataFile(folderPath));
 
 /*
  * Saves the full metadata object to photo-map-data.json inside the photo folder.
+ * Converts absolute in-memory keys to folder-relative keys on disk (portable).
+ * Uses an atomic temp-file + rename write to prevent corruption on crash.
  * Input: { folderPath, metadata }
  * Returns: { success: true } or { success: false, error }
  */
 ipcMain.handle('write-metadata', (event, { folderPath, metadata }) =>
-  writeMetadata(folderPath, metadata)
+  writeMetadataFileAtomic(folderPath, metadata)
 );
 
 /*
