@@ -68,6 +68,8 @@ A free-text notes field for anything you want to remember about the photo. Notes
 ### Mark GPS as Incorrect
 Tick **⚠ Mark GPS data as incorrect** to flag a photo whose GPS coordinates are wrong or unreliable. This removes the pin from the map but keeps the photo in the Photo List with a ⚠ badge. Untick it to restore the pin.
 
+While the photo is open in the details panel, a ⚠ warning marker is shown on the map at the photo's stored coordinates so you can see where it would be placed before deciding whether to correct or clear the location.
+
 ### Pin Colour
 Choose a colour for this photo's pin. This overrides the global pin colour set in Settings. Click **Use Global** to remove the per-photo colour and go back to the default.
 
@@ -150,6 +152,7 @@ Click **⚙ Settings** in the toolbar to open the settings panel.
 | **Default Pin Colour** | Sets the colour used for all pins that don't have an individual colour assigned. |
 | **Export GeoJSON** | Saves all GPS photos and their annotations to a `.geojson` file you choose. Compatible with QGIS, ArcGIS, Mapbox, and most other mapping tools. |
 | **Export CSV** | Saves a spreadsheet with one row per photo — filename, coordinates, date, note, and GPS flag. Opens directly in Excel or Google Sheets. |
+| **Pre-generate thumbnails on startup** | When ticked, the app generates thumbnails for HEIC, HEIF, and DNG photos in the background immediately after each scan, so they appear instantly when you open them. A progress overlay shows the count and a progress bar; click **Cancel** to stop early. Photos that already have a cached thumbnail are skipped. JPEG, PNG, WebP, and AVIF photos are unaffected. |
 | **Clear All Thumbnails** | Deletes the thumbnail cache to free up disk space. Thumbnails regenerate on demand the next time you view a photo. |
 
 ---
@@ -251,11 +254,11 @@ Photo Map is built with [Electron](https://www.electronjs.org/), which packages 
 │  │  • Reads/writes files    │  creates a     │                         │  │
 │  │  • Scans EXIF data       │  safe bridge   │  • Leaflet/MapTiler map │  │
 │  │  • Makes thumbnails      │  called        │  • Photo pin markers    │  │
-│  │    (worker thread)       │  window        │  • Info panel + undo    │  │
+│  │    (worker thread pool)  │  window        │  • Info panel + undo    │  │
 │  │  • Renames files         │  .photoMap     │  • Quick Rename mode    │  │
 │  │  • Manages lock file     │                │  • Settings + export    │  │
 │  │  • Watches folder        │                │  • Label placement      │  │
-│  │  • Exports GeoJSON/CSV   │                │                         │  │
+│  │  • Exports GeoJSON/CSV   │                │  • Thumbnail pregen     │  │
 │  └──────────────────────────┘                └─────────────────────────┘  │
 │                                                                           │
 │  electron-store — saves API key, folder path, sidebar width, pin color    │
@@ -284,12 +287,13 @@ The renderer is split into focused ES modules. `renderer.js` is a thin orchestra
 | `scanner.js` | Scan pipeline, folder watching, settings reload, lock-screen helpers |
 | `state.js` | Shared mutable state, DOM refs, constants |
 | `metadata.js` | Read / write `photo-map-data.json`; migration runner |
-| `map.js` | Leaflet init, pin markers, address search |
+| `map.js` | Leaflet init, pin markers, address search, panel warning marker |
 | `photoList.js` | Left sidebar photo list, search, filter |
 | `infoPanel.js` | Right info panel, GPS editor, rename, lightbox, sidebar resize |
 | `labels.js` | Map text label placement, editing, persistence |
 | `quickRename.js` | Full-screen rename mode |
 | `settings.js` | Settings overlay, GeoJSON/CSV export, README viewer |
+| `pregen.js` | Pre-generate thumbnails progress overlay and trigger logic |
 
 ### Startup Sequence
 1. `main.js` creates the browser window and loads `index.html`.
@@ -297,9 +301,9 @@ The renderer is split into focused ES modules. `renderer.js` is a thin orchestra
 3. `renderer.js` reads saved settings, then shows the setup screen pre-populated with the last-used folder and API key.
 4. The user clicks **Open Map →**; the app writes the lock file and initialises the Leaflet map.
 5. The folder is scanned; live progress appears in the status bar.
-6. HEIC/DNG thumbnail generation runs in a background worker thread so the UI stays responsive.
-7. Pins are placed on the map for every photo that has GPS data.
-8. `scanner.js` starts `chokidar` watching the folder; adding or removing a photo file triggers a re-scan automatically.
+6. Pins are placed on the map for every photo that has GPS data.
+7. `scanner.js` starts `chokidar` watching the folder; adding or removing a photo file triggers a per-file scan automatically.
+8. If **Pre-generate thumbnails on startup** is enabled, `pregen.js` filters the photo list to HEIC/HEIF/DNG files whose thumbnails are not yet cached, then sends them to the main-process worker pool in batches of 2 while the progress overlay is shown.
 
 ### Files Created by the App
 
@@ -312,7 +316,9 @@ The renderer is split into focused ES modules. `renderer.js` is a thin orchestra
 | Settings | Same app data folder | API key, folder path, sidebar width, global pin colour |
 
 ### Thumbnail Generation
-Thumbnails for formats the browser can display natively (JPEG, PNG, WebP, AVIF) are served directly from the original file — no copy is made. For HEIC, HEIF, and DNG files, a JPEG preview is generated in a background worker thread and cached. The cache path for a given file is a SHA-256 hash of the file path, so filenames cannot be guessed from the cache.
+Thumbnails for formats the browser can display natively (JPEG, PNG, WebP, AVIF) are served directly from the original file — no copy is made. For HEIC, HEIF, and DNG files, a JPEG preview is generated in a background worker thread and cached. The worker tries three strategies in order: extract an embedded JPEG preview (fastest, common on iPhone HEIC files), decode with the `heic-convert` JavaScript library, then fall back to `sharp`. The cache path for a given file is a SHA-1 hash of the file path, so filenames cannot be guessed from the cache. The cache is capped at 500 MB; oldest entries are evicted automatically when the cap is exceeded.
+
+Worker concurrency is capped at `max(2, min(cpu_count − 1, 4))` so thumbnail generation never monopolises all available cores.
 
 ### GPS Coordinate Override Design
 Manual GPS overrides are stored in `photo-map-data.json` under the key `gpsOverride: { lat, lng }` for each photo. The renderer holds the authoritative state in memory; every operation that changes coordinates immediately calls `saveMetadata()` to flush to disk. The original EXIF coordinates from the photo file are always used as the fallback when no override is present — the override is a layer on top, not a replacement.
