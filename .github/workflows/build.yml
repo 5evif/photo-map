@@ -43,6 +43,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Bundle renderer
+        run: npm run bundle
+
       - name: Lint
         run: npm run lint
 
@@ -73,6 +76,9 @@ jobs:
 
       - name: Rebuild native modules for Electron
         run: npm run rebuild
+
+      - name: Bundle renderer
+        run: npm run bundle
 
       - name: Build Windows installer
         run: npx electron-builder --win
@@ -114,6 +120,9 @@ jobs:
 
       - name: Rebuild native modules for Electron
         run: npm run rebuild
+
+      - name: Bundle renderer
+        run: npm run bundle
 
       - name: Build macOS DMG
         run: npx electron-builder --mac
@@ -161,6 +170,9 @@ jobs:
 
       - name: Rebuild native modules for Electron
         run: npm run rebuild
+
+      - name: Bundle renderer
+        run: npm run bundle
 
       - name: Build Linux packages
         run: npx electron-builder --linux

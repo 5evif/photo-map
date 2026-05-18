@@ -4,15 +4,20 @@
   "description": "Scan a folder of photos, extract GPS coordinates, and view them on a map",
   "main": "src/main/main.js",
   "scripts": {
-    "start": "electron .",
+    "bundle": "vite build",
+    "bundle:watch": "vite build --watch",
+    "start": "npm-run-all bundle _start:electron",
+    "_start:electron": "electron .",
+    "dev": "npm-run-all bundle _dev:electron",
+    "_dev:electron": "electron .",
     "rebuild": "electron-rebuild -f -w sharp",
-    "build:win": "npm-run-all rebuild _build:win",
+    "build:win": "npm-run-all rebuild bundle _build:win",
     "_build:win": "electron-builder --win",
-    "build:mac": "npm-run-all rebuild _build:mac",
+    "build:mac": "npm-run-all rebuild bundle _build:mac",
     "_build:mac": "electron-builder --mac",
-    "build:linux": "npm-run-all rebuild _build:linux",
+    "build:linux": "npm-run-all rebuild bundle _build:linux",
     "_build:linux": "electron-builder --linux",
-    "build": "npm-run-all rebuild _build:all",
+    "build": "npm-run-all rebuild bundle _build:all",
     "_build:all": "electron-builder",
     "lint": "eslint \"src/**/*.js\"",
     "test": "node --test tests/unit.test.js"
@@ -43,7 +48,8 @@
     "electron": "^42.0.0",
     "electron-builder": "^26.0.0",
     "eslint": "^8.57.0",
-    "npm-run-all": "^4.1.5"
+    "npm-run-all": "^4.1.5",
+    "vite": "^8.0.13"
   },
   "build": {
     "appId": "com.photomap.app",
@@ -53,6 +59,7 @@
     },
     "files": [
       "src/**/*",
+      "dist-renderer/**/*",
       "assets/**/*",
       "node_modules/**/*",
       "package.json",

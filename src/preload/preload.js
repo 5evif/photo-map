@@ -19,6 +19,7 @@
  * "save-settings"         — Persist updated settings to disk.
  * "pick-folder"           — Open the OS folder-picker dialog; returns the chosen path.
  * "scan-folder"           — Scan the photo folder; returns GPS data array.
+ * "scan-single-file"     — Scan one newly-added file; avoids full folder re-scan on add events.
  * "get-thumbnail"         — Generate/retrieve a cached thumbnail; returns path.
  * "rename-file"           — Rename a file on disk.
  * "show-in-folder"        — Reveal a file in Finder / Explorer.
@@ -64,6 +65,14 @@ contextBridge.exposeInMainWorld('photoMap', {
    * Returns: { photos, totalScanned, totalWithGps, errors }
    */
   scanFolder: (opts) => ipcRenderer.invoke('scan-folder', opts),
+
+  /**
+   * Scans a single newly-added file for GPS data.
+   * Preferred over scanFolder when chokidar reports one new photo.
+   * Input:   filePath string
+   * Returns: { success, photo?, noGps? }
+   */
+  scanSingleFile: (filePath) => ipcRenderer.invoke('scan-single-file', filePath),
 
   // ── Thumbnails ────────────────────────────────────────────────────────────────
 

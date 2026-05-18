@@ -186,6 +186,8 @@ body.macos #toolbar {
   cursor: pointer;
   transition: background .12s;
   display: flex; flex-direction: column; gap: 3px;
+  /* Fixed height required by the virtual scroller — must match ROW_HEIGHT in photoList.js */
+  height: 56px; box-sizing: border-box; overflow: hidden;
 }
 
 .list-row:hover  { background: var(--surface2); }

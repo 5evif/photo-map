@@ -67,12 +67,16 @@ const { Worker } = require('worker_threads'); // built into Node.js — runs thu
 const path   = require('path');
 const fs     = require('fs');
 const https  = require('https');
-const os     = require('os');     // built into Node.js — used for the machine hostname in lock files
+const os     = require('os');     // built into Node.js — used for cpu count (thumbnail pool)
 const crypto = require('crypto'); // built into Node.js — used to hash thumbnail filenames
 const Store  = require('electron-store');
 const chokidar = require('chokidar');
 const exifr    = require('exifr');  // reads GPS and date from photo EXIF metadata
-const { isPidRunning, csvEscape, SUPPORTED_EXTENSIONS } = require('../utils.js');
+const { SUPPORTED_EXTENSIONS } = require('../utils.js');
+const { METADATA_FILENAME, readMetadataFile, writeMetadataFileAtomic } = require('./metadata-io.js');
+const { LOCK_FILENAME, readLock, acquireLock, releaseLock } = require('./lock.js');
+const { collectPhotoFiles } = require('./scan.js');
+const { buildGeoJson, buildCsv } = require('./export-format.js');
 
 // ─── App-wide state ────────────────────────────────────────────────────────────
 
@@ -89,19 +93,9 @@ const store = new Store({
   }
 });
 
-const THUMBNAIL_CACHE_DIR = path.join(app.getPath('userData'), 'thumbnails');
-const GPS_CACHE_FILE      = path.join(app.getPath('userData'), 'gps-cache.json');
-
-// This file lives inside the user's photo folder so data travels with the photos.
-const METADATA_FILENAME = 'photo-map-data.json';
-
-// The lock file sits next to the metadata file. Its presence means someone else
-// currently has this folder open and is editing annotations. We create it when
-// we open a folder and delete it when we close the app or switch folders.
-const LOCK_FILENAME = 'photo-map-data.lock';
-
-// Track which folder we currently hold a lock on so we can release it cleanly.
-let currentLockFolder = null;
+const THUMBNAIL_CACHE_DIR      = path.join(app.getPath('userData'), 'thumbnails');
+const GPS_CACHE_FILE           = path.join(app.getPath('userData'), 'gps-cache.json');
+const THUMBNAIL_CACHE_MAX_BYTES = 500 * 1024 * 1024; // 500 MB — evict oldest thumbnails beyond this
 
 let folderWatcher = null;  // chokidar watcher instance
 let mainWindow    = null;  // the BrowserWindow
@@ -139,7 +133,7 @@ function createWindow() {
     backgroundColor: '#1a1a2e'
   });
 
-  mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+  mainWindow.loadFile(path.join(__dirname, '..', '..', 'dist-renderer', 'index.html'));
 
   // Redirect any navigation away from the local app file to the system browser.
   // Without this, clicking an <a href="https://..."> in the renderer replaces the
@@ -180,218 +174,13 @@ function saveGpsCache(cache) {
   catch (err) { console.error('Could not save GPS cache:', err.message); }
 }
 
-// ─── Per-Folder Metadata File ──────────────────────────────────────────────────
-
-/*
- * Returns the full path to the metadata file inside the photo folder.
- * Example: "/Users/sara/Trips/photo-map-data.json"
- */
-function metadataFilePath(folderPath) {
-  return path.join(folderPath, METADATA_FILENAME);
-}
-
-/*
- * Reads the metadata file from the given photo folder.
- * Returns a fresh empty object if the file doesn't exist yet.
- *
- * The metadata shape is:
- * {
- *   version: 1,
- *   pinColor: "#4f8ef7",      ← global default pin color
- *   labels: [ { id, lat, lng, text, size }, … ],
- *   photos: {
- *     "/full/path/to/photo.jpg": {
- *       note:     "string or empty",
- *       badGps:   true/false,
- *       pinColor: "#rrggbb or null to use global"
- *     },
- *     …
- *   }
- * }
- */
-function readMetadata(folderPath) {
-  try {
-    const fp = metadataFilePath(folderPath);
-    if (fs.existsSync(fp))
-      return JSON.parse(fs.readFileSync(fp, 'utf8'));
-  } catch (err) { console.error('Could not read metadata:', err.message); }
-  return { version: 1, pinColor: '#4f8ef7', labels: [], photos: {} };
-}
-
-/*
- * Writes the metadata object to photo-map-data.json in the photo folder.
- * Input: folderPath — the photo folder
- *        metadata   — the complete metadata object to save
- * Returns: { success: true } or { success: false, error }
- */
-function writeMetadata(folderPath, metadata) {
-  try {
-    fs.writeFileSync(metadataFilePath(folderPath), JSON.stringify(metadata, null, 2), 'utf8');
-    return { success: true };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
-}
-
-// ─── Lock File Management ─────────────────────────────────────────────────────
-//
-// We use a plain JSON file ("photo-map-data.lock") as a cooperative lock.
-// When Photo Map opens a folder it writes this file with the current user's
-// name, machine name, and a timestamp.  Before opening, it checks whether
-// the file already exists and reports back to the renderer so it can block
-// access and show a clear error message.
-//
-// Limitations: this is a cooperative lock, not a filesystem-level exclusive
-// lock.  It protects against two people running the app at the same time on
-// shared network storage.  It does not protect against someone deleting the
-// lock file manually, but that is an intentional escape hatch for stuck locks.
-
-/*
- * Returns the full path to the lock file for the given photo folder.
- * Example: "/Volumes/Server/Photos/photo-map-data.lock"
- */
-function lockFilePath(folderPath) {
-  return path.join(folderPath, LOCK_FILENAME);
-}
-
-/*
- * Reads and returns the contents of the lock file, or null if none exists.
- * Returns an object like: { user, machine, pid, timestamp }
- */
-function readLock(folderPath) {
-  try {
-    const lp = lockFilePath(folderPath);
-    if (fs.existsSync(lp))
-      return JSON.parse(fs.readFileSync(lp, 'utf8'));
-  } catch (err) {
-    console.warn('Could not read lock file:', err.message);
-  }
-  return null;
-}
-
-/*
- * Creates the lock file for the given folder, recording who opened it.
- *
- * Before writing, checks whether a lock file already exists:
- *   - If it belongs to this process (same PID) → already locked by us, succeed.
- *   - If the PID in the file is no longer running → stale lock from a crash,
- *     overwrite it and succeed.
- *   - If the PID is still running → genuinely locked by another instance, fail
- *     and return the lock holder's details.
- *
- * Input:  folderPath — the photo folder to lock
- * Returns: { success: true }
- *       or { success: false, error: 'locked',    lockedBy: { user, machine, pid, timestamp } }
- *       or { success: false, error: 'unwritable', message: "..." }
- */
-function acquireLock(folderPath) {
-  const existing = readLock(folderPath);
-
-  if (existing) {
-    // Same process — already our lock (e.g. Settings reload within a session).
-    if (existing.pid === process.pid) {
-      currentLockFolder = folderPath;
-      return { success: true };
-    }
-
-    // Different PID — check whether that process is still alive.
-    // process.kill(pid, 0) doesn't send a signal; it just checks existence.
-    // If the process is gone it throws an error, meaning the lock is stale.
-    const pidStillRunning = isPidRunning(existing.pid);
-
-    if (pidStillRunning) {
-      // Genuinely locked by another live instance — block access.
-      return {
-        success:  false,
-        error:    'locked',
-        lockedBy: existing
-      };
-    }
-
-    // Stale lock (app crashed or was force-killed without cleanup).
-    // Log it and fall through to overwrite with our own lock.
-    console.warn(
-      `Removing stale lock left by PID ${existing.pid} (${existing.user}@${existing.machine})`
-    );
-  }
-
-  // Folder is free — write our lock file.
-  try {
-    const lockData = {
-      user:      os.userInfo().username || os.userInfo().uid?.toString() || 'unknown',
-      machine:   os.hostname() || 'unknown',
-      pid:       process.pid,
-      timestamp: new Date().toISOString()
-    };
-    fs.writeFileSync(lockFilePath(folderPath), JSON.stringify(lockData, null, 2), 'utf8');
-    currentLockFolder = folderPath;
-    return { success: true };
-  } catch (err) {
-    return { success: false, error: 'unwritable', message: err.message };
-  }
-}
-
-/*
- * Deletes the lock file for the given folder (or the currently locked folder
- * if no path is supplied).  Safe to call even if no lock exists.
- */
-function releaseLock(folderPath) {
-  const target = folderPath || currentLockFolder;
-  if (!target) return;
-  try {
-    const lp = lockFilePath(target);
-    if (fs.existsSync(lp)) {
-      // Only delete the lock if it belongs to this process — never steal
-      // another instance's lock.
-      const lock = readLock(target);
-      if (lock && lock.pid === process.pid) {
-        fs.unlinkSync(lp);
-      }
-    }
-  } catch (err) {
-    console.warn('Could not release lock file:', err.message);
-  }
-  if (target === currentLockFolder) currentLockFolder = null;
-}
-
-// ─── Folder Scanning ───────────────────────────────────────────────────────────
-
-/*
- * Recursively collects all photo file paths from a folder.
- * Input: folderPath — full path to the folder
- *        recursive  — true to include subfolders
- * Returns: array of file-path strings
- */
-function collectPhotoFiles(folderPath, recursive) {
-  const results = [];
-
-  function walk(dir) {
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
-    catch (err) { console.error(`Cannot read ${dir}:`, err.message); return; }
-
-    for (const entry of entries) {
-      if (entry.name === METADATA_FILENAME) continue; // skip our own metadata file
-      if (entry.name === LOCK_FILENAME) continue;        // skip our own lock file
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory() && recursive) { walk(full); }
-      else if (entry.isFile() && SUPPORTED_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
-        results.push(full);
-      }
-    }
-  }
-
-  walk(folderPath);
-  return results;
-}
-
 /*
  * Extracts GPS + date from a single photo using exifr.
  * Returns null if the file has no GPS data or can't be read.
  */
 async function extractPhotoData(filePath) {
   try {
-    const stat  = fs.statSync(filePath);
+    const stat  = await fs.promises.stat(filePath);
     const data  = await exifr.parse(filePath, {
       pick: ['GPSLatitude','GPSLongitude','GPSLatitudeRef','GPSLongitudeRef',
              'DateTimeOriginal','CreateDate']
@@ -429,16 +218,18 @@ async function scanFolder(folderPath, recursive) {
   const noGpsPhotos = [];
   const errors      = [];
 
-  const files = collectPhotoFiles(folderPath, recursive);
+  const files = await collectPhotoFiles(folderPath, recursive);
   const totalScanned = files.length;
 
-  const BATCH_SIZE = 20;
+  // Scale batch size to available CPU cores so we don't under-use multi-core
+  // machines or thrash single-core ones with excessive parallelism.
+  const BATCH_SIZE = Math.max(4, os.cpus().length);
   let processedCount = 0;
 
   for (let i = 0; i < files.length; i += BATCH_SIZE) {
     await Promise.all(files.slice(i, i + BATCH_SIZE).map(async (filePath) => {
       try {
-        const stat   = fs.statSync(filePath);
+        const stat   = await fs.promises.stat(filePath);
         const cached = cache[filePath];
 
         if (cached && cached.mtimeMs === stat.mtimeMs) {
@@ -472,11 +263,98 @@ async function scanFolder(folderPath, recursive) {
     }));
   }
 
-  saveGpsCache(updatedCache);
+  // Merge: preserve cache entries from other folders; replace entries for this
+  // folder with the freshly scanned results (which also drops entries for files
+  // that have since been deleted from this folder).
+  const folderPrefix = folderPath.endsWith(path.sep) ? folderPath : folderPath + path.sep;
+  const mergedCache  = { ...cache };
+  for (const fp of Object.keys(mergedCache)) {
+    if (fp.startsWith(folderPrefix) && !updatedCache[fp]) delete mergedCache[fp];
+  }
+  Object.assign(mergedCache, updatedCache);
+  saveGpsCache(mergedCache);
+
   return { photos, noGpsPhotos, totalScanned, totalWithGps: photos.length, errors };
 }
 
 // ─── Thumbnail Generation (worker thread) ─────────────────────────────────────
+
+/*
+ * Evicts the oldest thumbnails if the cache directory exceeds THUMBNAIL_CACHE_MAX_BYTES.
+ * Called asynchronously after each successful thumbnail write — does not block
+ * the caller or affect the returned thumbnail path.
+ */
+async function enforceThumbnailCacheSize() {
+  try {
+    const names   = await fs.promises.readdir(THUMBNAIL_CACHE_DIR);
+    const entries = (await Promise.all(
+      names.map(async n => {
+        const fp = path.join(THUMBNAIL_CACHE_DIR, n);
+        try { const s = await fs.promises.stat(fp); return { fp, size: s.size, mtime: s.mtimeMs }; }
+        catch { return null; }
+      })
+    )).filter(Boolean);
+
+    const total = entries.reduce((s, e) => s + e.size, 0);
+    if (total <= THUMBNAIL_CACHE_MAX_BYTES) return;
+
+    entries.sort((a, b) => a.mtime - b.mtime); // oldest first
+    let remaining = total;
+    for (const { fp, size } of entries) {
+      if (remaining <= THUMBNAIL_CACHE_MAX_BYTES) break;
+      await fs.promises.unlink(fp).catch(() => {});
+      remaining -= size;
+    }
+  } catch (err) {
+    console.error('Thumbnail cache eviction error:', err.message);
+  }
+}
+
+/*
+ * Thumbnail worker pool.
+ *
+ * Caps concurrent thumbnail-worker threads at THUMBNAIL_CONCURRENCY so that
+ * opening many photos quickly (e.g. quick-rename mode) does not spawn an
+ * unbounded number of workers.  Requests beyond the cap are queued and
+ * processed as workers finish.  Each worker's 'exit' event is the single
+ * point that decrements the counter and drains the queue, preventing the
+ * double-decrement that occurred when 'error' and 'exit' both fired.
+ */
+const THUMBNAIL_CONCURRENCY = Math.max(2, Math.min(os.cpus().length - 1, 6));
+const _thumbQueue            = []; // { filePath, thumbPath, resolve }
+let   _activeThumbWorkers    = 0;
+
+function _runNextThumbWorker() {
+  while (_activeThumbWorkers < THUMBNAIL_CONCURRENCY && _thumbQueue.length) {
+    const { filePath, thumbPath, resolve } = _thumbQueue.shift();
+    _activeThumbWorkers++;
+
+    const worker = new Worker(
+      path.join(__dirname, 'thumbnail-worker.js'),
+      { workerData: { filePath, thumbPath } }
+    );
+
+    let result = null;
+
+    worker.on('message', (msg) => {
+      if (msg.success) enforceThumbnailCacheSize(); // fire-and-forget
+      result = msg.success ? msg.thumbPath : null;
+    });
+
+    worker.on('error', (err) => {
+      console.error(`Thumbnail worker error for ${filePath}:`, err.message);
+    });
+
+    // 'exit' always fires last — resolve here so 'message'/'error' have run first.
+    worker.on('exit', (code) => {
+      if (code !== 0 && result === null)
+        console.error(`Thumbnail worker exited with code ${code} for ${filePath}`);
+      resolve(result);
+      _activeThumbWorkers--;
+      _runNextThumbWorker();
+    });
+  }
+}
 
 /*
  * Generates (or retrieves from cache) a JPEG thumbnail for a photo.
@@ -496,31 +374,9 @@ async function getThumbnail(filePath) {
   // Return cached version immediately — no worker needed.
   if (fs.existsSync(thumbPath)) return thumbPath;
 
-  // Spawn a worker thread to generate the thumbnail.
-  // Using a thread means HEIC decoding (which can take 1–3 seconds for large
-  // iPhone photos) does not block any other IPC calls or UI updates.
   return new Promise((resolve) => {
-    const worker = new Worker(
-      path.join(__dirname, 'thumbnail-worker.js'),
-      { workerData: { filePath, thumbPath } }
-    );
-
-    worker.on('message', (result) => {
-      resolve(result.success ? result.thumbPath : null);
-    });
-
-    worker.on('error', (err) => {
-      console.error(`Thumbnail worker error for ${filePath}:`, err.message);
-      resolve(null);
-    });
-
-    // If the worker crashes entirely, resolve null so the UI shows gracefully.
-    worker.on('exit', (code) => {
-      if (code !== 0) {
-        console.error(`Thumbnail worker exited with code ${code} for ${filePath}`);
-        resolve(null);
-      }
-    });
+    _thumbQueue.push({ filePath, thumbPath, resolve });
+    _runNextThumbWorker();
   });
 }
 
@@ -554,6 +410,42 @@ ipcMain.handle('scan-folder', async (event, { folderPath, recursive }) => {
   if (!fs.existsSync(folderPath))
     return { error: 'Folder not found. Please select a different folder in Settings.' };
   return scanFolder(folderPath, recursive);
+});
+
+/*
+ * Scans a single newly-added file instead of the whole folder.
+ * Called by the renderer when chokidar reports a new photo so we don't
+ * re-extract EXIF from every file in the folder on each add event.
+ * Returns: { success, photo?, noGps? }
+ */
+ipcMain.handle('scan-single-file', async (event, filePath) => {
+  if (typeof filePath !== 'string' || !SUPPORTED_EXTENSIONS.has(path.extname(filePath).toLowerCase()))
+    return { success: false, error: 'Invalid file path' };
+  try {
+    const cache  = loadGpsCache();
+    const stat   = await fs.promises.stat(filePath);
+    const cached = cache[filePath];
+
+    let data;
+    if (cached && cached.mtimeMs === stat.mtimeMs) {
+      data = cached;
+    } else {
+      data = await extractPhotoData(filePath);
+      if (data) {
+        cache[filePath] = data;
+        saveGpsCache(cache);
+      }
+    }
+
+    if (!data) return { success: false, error: 'Could not read file metadata' };
+    return {
+      success: true,
+      photo:  !data.noGps ? data : null,
+      noGps:   data.noGps ? data : null
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
 });
 
 ipcMain.handle('get-thumbnail', async (event, filePath) => getThumbnail(filePath));
@@ -611,8 +503,11 @@ ipcMain.handle('show-in-folder', (event, filePath) => shell.showItemInFolder(fil
 // and returns the HTTP status code.  Used by the renderer to distinguish
 // "bad API key" (401/403) from "quota exceeded" (429) tile errors.
 ipcMain.handle('check-tile-status', (event, url) => {
-  // Only allow HTTPS requests to MapTiler domains to prevent SSRF.
-  if (typeof url !== 'string' || !/^https:\/\/[a-z0-9-]+\.maptiler\.com\//i.test(url))
+  // Use the URL constructor (not a regex) to parse the URL — this is immune to
+  // bypass tricks like embedded credentials or Unicode homoglyphs.
+  let parsed;
+  try { parsed = new URL(url); } catch { return { status: 0 }; }
+  if (parsed.protocol !== 'https:' || !parsed.hostname.endsWith('.maptiler.com'))
     return { status: 0 };
   return new Promise((resolve) => {
     const req = https.request(url, { method: 'HEAD' }, (res) => {
@@ -624,10 +519,10 @@ ipcMain.handle('check-tile-status', (event, url) => {
   });
 });
 
-ipcMain.handle('clear-thumbnail-cache', () => {
+ipcMain.handle('clear-thumbnail-cache', async () => {
   try {
-    const files = fs.readdirSync(THUMBNAIL_CACHE_DIR);
-    for (const f of files) fs.unlinkSync(path.join(THUMBNAIL_CACHE_DIR, f));
+    const files = await fs.promises.readdir(THUMBNAIL_CACHE_DIR);
+    await Promise.all(files.map(f => fs.promises.unlink(path.join(THUMBNAIL_CACHE_DIR, f))));
     return { success: true, count: files.length };
   } catch (err) { return { success: false, error: err.message }; }
 });
@@ -668,17 +563,19 @@ ipcMain.handle('stop-watching', () => {
 /*
  * Reads photo-map-data.json from the given photo folder.
  * Input: folderPath string
- * Returns: metadata object (never null — returns empty structure if file missing)
+ * Returns: metadata object with absolute-path keys (never null — falls back to empty structure)
  */
-ipcMain.handle('read-metadata', (event, folderPath) => readMetadata(folderPath));
+ipcMain.handle('read-metadata', (event, folderPath) => readMetadataFile(folderPath));
 
 /*
  * Saves the full metadata object to photo-map-data.json inside the photo folder.
+ * Converts absolute in-memory keys to folder-relative keys on disk (portable).
+ * Uses an atomic temp-file + rename write to prevent corruption on crash.
  * Input: { folderPath, metadata }
  * Returns: { success: true } or { success: false, error }
  */
 ipcMain.handle('write-metadata', (event, { folderPath, metadata }) =>
-  writeMetadata(folderPath, metadata)
+  writeMetadataFileAtomic(folderPath, metadata)
 );
 
 /*
@@ -772,44 +669,7 @@ ipcMain.handle('export-data', async (event, { photos, metadata, format }) => {
   if (result.canceled) return { success: false, error: 'Cancelled' };
 
   try {
-    let output = '';
-
-    if (isGeoJson) {
-      // Build a GeoJSON FeatureCollection — each photo is a Point feature.
-      const features = photos.map(p => {
-        const pm = (metadata.photos || {})[p.filePath] || {};
-        return {
-          type: 'Feature',
-          geometry: { type: 'Point', coordinates: [p.lng, p.lat] }, // GeoJSON is [lng, lat]
-          properties: {
-            filename: p.filename,
-            filePath: p.filePath,
-            date:     p.date || null,
-            note:     pm.note     || '',
-            badGps:   pm.badGps   || false,
-            pinColor: pm.pinColor || null
-          }
-        };
-      });
-      output = JSON.stringify({ type: 'FeatureCollection', features }, null, 2);
-
-    } else {
-      // Build a CSV.
-      const header = ['filename', 'latitude', 'longitude', 'date', 'note', 'bad_gps'];
-      const rows   = photos.map(p => {
-        const pm = (metadata.photos || {})[p.filePath] || {};
-        return [
-          csvEscape(p.filename),
-          p.lat,
-          p.lng,
-          csvEscape(p.date || ''),
-          csvEscape(pm.note || ''),
-          pm.badGps ? 'true' : 'false'
-        ].join(',');
-      });
-      output = [header.join(','), ...rows].join('\n');
-    }
-
+    const output = isGeoJson ? buildGeoJson(photos, metadata) : buildCsv(photos, metadata);
     fs.writeFileSync(result.filePath, output, 'utf8');
     return { success: true, count: photos.length };
   } catch (err) {
