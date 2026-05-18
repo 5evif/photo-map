@@ -34,16 +34,18 @@ import {
   scanAndDisplay, watchFolder, handleFolderChange,
   applyNewSettings, showLockError, hideLockError, setFolderName
 } from './scanner.js';
+import { registerPregenEvents } from './pregen.js';
 
 // ─── Initialization ────────────────────────────────────────────────────────────
 
 async function init() {
   const settings = await window.photoMap.getSettings();
-  state.apiKey       = settings.apiKey      || '';
-  state.folderPath   = settings.folderPath  || '';
-  state.recursive    = settings.recursive   !== false;
-  state.sidebarWidth = settings.sidebarWidth || 340;
-  state.pinColor     = settings.pinColor    || DEFAULT_PIN_COLOR;
+  state.apiKey            = settings.apiKey             || '';
+  state.folderPath        = settings.folderPath         || '';
+  state.recursive         = settings.recursive          !== false;
+  state.sidebarWidth      = settings.sidebarWidth       || 340;
+  state.pinColor          = settings.pinColor           || DEFAULT_PIN_COLOR;
+  state.pregenThumbnails  = settings.pregenThumbnails   === true;
 
   applySidebarWidth(state.sidebarWidth);
 
@@ -151,6 +153,7 @@ function bindAppEvents() {
   registerInfoPanelEvents();
   registerLabelEvents();
   registerSettingsEvents(applyNewSettings);
+  registerPregenEvents();
 
   // Global keyboard shortcuts (cross-module: must stay here)
   document.addEventListener('keydown', (e) => {

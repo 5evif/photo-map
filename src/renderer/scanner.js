@@ -16,6 +16,7 @@ import { renderPhotoList }         from './photoList.js';
 import { closeInfoPanel }          from './infoPanel.js';
 import { renderAllLabels, clearAllLabels } from './labels.js';
 import { closeSettingsPanel }      from './settings.js';
+import { runPregen }               from './pregen.js';
 
 // ─── Scan ─────────────────────────────────────────────────────────────────────
 
@@ -44,6 +45,8 @@ export async function scanAndDisplay() {
 
   const errMsg = result.errors.length ? ` (${result.errors.length} errors)` : '';
   setStatus(`${result.totalScanned} photos scanned · ${result.totalWithGps} with GPS${errMsg}`);
+
+  runPregen(state.photos);
 }
 
 export async function mergeNoGpsPhotos(noGpsPhotos) {

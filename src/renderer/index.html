@@ -296,6 +296,11 @@
 
       <div class="settings-section">
         <label>Thumbnail Cache</label>
+        <label class="checkbox-label">
+          <input type="checkbox" id="pregen-thumbnails-chk"/>
+          Pre-generate thumbnails on startup
+        </label>
+        <p class="field-hint">Generates thumbnails for HEIC, HEIF and DNG photos in advance so they load instantly. Runs after each scan when enabled.</p>
         <button id="clear-cache-btn" class="btn btn-danger btn-small">Clear All Thumbnails</button>
         <p class="field-hint">Frees up disk space. Thumbnails regenerate on demand.</p>
       </div>
@@ -311,7 +316,7 @@
       <div class="about-section">
         <div class="about-divider"></div>
         <p class="about-title">Photo Map</p>
-        <p class="about-meta">Build 2.0.0 &nbsp;·&nbsp; 2026-05-16</p>
+        <p class="about-meta">Build 2.0.1 &nbsp;·&nbsp; 2026-05-18</p>
         <p class="about-credit">Built by Alex Tyler &amp; Claude</p>
       </div>
 
@@ -461,6 +466,20 @@
       <div id="readme-body" class="readme-body">
         <p class="readme-loading">Loading…</p>
       </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       THUMBNAIL PRE-GENERATION PROGRESS OVERLAY
+  ══════════════════════════════════════════════════════ -->
+  <div id="pregen-overlay" class="pregen-overlay hidden">
+    <div class="pregen-card">
+      <p class="pregen-title">Generating Thumbnails</p>
+      <p id="pregen-progress-text" class="pregen-progress-text">0 / 0</p>
+      <div class="pregen-bar-track">
+        <div id="pregen-progress-bar" class="pregen-bar-fill"></div>
+      </div>
+      <button id="pregen-cancel-btn" class="btn btn-secondary btn-small">Cancel</button>
     </div>
   </div>
 

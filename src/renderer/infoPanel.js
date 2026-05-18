@@ -7,7 +7,7 @@
 import { getExtension, formatDate, BROWSER_IMAGE_FORMATS } from '../utils.js';
 import { state, el } from './state.js';
 import { getPhotoMeta, saveMetadata } from './metadata.js';
-import { setMarkerHighlight, placeOrMoveMarker, refreshMarkerPin, resolveColor, resolvePhotoDisplayUrl } from './map.js';
+import { setMarkerHighlight, placeOrMoveMarker, refreshMarkerPin, resolveColor, resolvePhotoDisplayUrl, showPanelMarker, hidePanelMarker } from './map.js';
 import { getFilteredPhotos, renderPhotoList, updateNavButtons } from './photoList.js';
 
 // ─── Info panel open / close ──────────────────────────────────────────────────
@@ -21,10 +21,12 @@ export async function openInfoPanel(photoData) {
       saveMetadata().then(() => renderPhotoList());
     }
     setMarkerHighlight(state.activePhoto.filePath, false);
+    hidePanelMarker();
   }
 
   state.activePhoto = photoData;
   setMarkerHighlight(photoData.filePath, true);
+  showPanelMarker(photoData);
   const pm = getPhotoMeta(photoData.filePath);
 
   const ext         = getExtension(photoData.filename);
@@ -57,7 +59,7 @@ export async function openInfoPanel(photoData) {
 
   el.infoPanel.classList.remove('hidden');
   el.resizeHandle.classList.remove('hidden');
-  state.map?.invalidateSize();
+  requestAnimationFrame(() => state.map?.invalidateSize());
   el.zoomBtn.classList.add('hidden');
 
   el.photoThumbnail.style.display  = 'none';
@@ -79,11 +81,12 @@ export async function openInfoPanel(photoData) {
 
 export function closeInfoPanel() {
   if (state.activePhoto) setMarkerHighlight(state.activePhoto.filePath, false);
+  hidePanelMarker();
   exitCoordsEditMode();
   el.infoPanel.classList.add('hidden');
   el.resizeHandle.classList.add('hidden');
   state.activePhoto = null;
-  state.map?.invalidateSize();
+  requestAnimationFrame(() => state.map?.invalidateSize());
   updateNavButtons();
 }
 
@@ -276,6 +279,8 @@ export async function handleBadGpsToggle() {
   pm.badGps = el.badGpsCheckbox.checked;
   await saveMetadata();
   refreshMarkerPin(state.activePhoto.filePath);
+  hidePanelMarker();
+  showPanelMarker(state.activePhoto);
   renderPhotoList();
 }
 

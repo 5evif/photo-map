@@ -49,9 +49,10 @@ export const state = {
   sidebarWidth:    340,
   isResizing:      false,
 
-  lastRename:      null,
-  listFilter:      'all',
-  lastNote:        null
+  lastRename:       null,
+  listFilter:       'all',
+  lastNote:         null,
+  pregenThumbnails: false
 };
 
 export const el = {
@@ -131,8 +132,9 @@ export const el = {
   settingsPinColor:   document.getElementById('settings-pin-color'),
   exportGeoJsonBtn:   document.getElementById('export-geojson-btn'),
   exportCsvBtn:       document.getElementById('export-csv-btn'),
-  clearCacheBtn:      document.getElementById('clear-cache-btn'),
-  settingsMessage:    document.getElementById('settings-message'),
+  clearCacheBtn:         document.getElementById('clear-cache-btn'),
+  pregenChk:             document.getElementById('pregen-thumbnails-chk'),
+  settingsMessage:       document.getElementById('settings-message'),
   saveSettingsBtn:    document.getElementById('save-settings-btn'),
   cancelSettingsBtn:  document.getElementById('cancel-settings-btn'),
   closeSettingsBtn:   document.getElementById('close-settings-btn'),
@@ -172,7 +174,13 @@ export const el = {
 
   // Map and body
   mapDiv:     document.getElementById('map'),
-  appBody:    document.getElementById('app-body')
+  appBody:    document.getElementById('app-body'),
+
+  // Pregen progress overlay
+  pregenOverlay:      document.getElementById('pregen-overlay'),
+  pregenProgressBar:  document.getElementById('pregen-progress-bar'),
+  pregenProgressText: document.getElementById('pregen-progress-text'),
+  pregenCancelBtn:    document.getElementById('pregen-cancel-btn')
 };
 
 // Quick-Rename runtime state — index, loading guard, mini-map references, undo snapshot.

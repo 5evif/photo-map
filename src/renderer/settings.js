@@ -14,6 +14,7 @@ export function openSettingsPanel() {
   el.settingsRecursive.checked  = state.recursive;
   el.settingsShowLabels.checked = state.labelsVisible;
   el.settingsPinColor.value     = state.meta.pinColor || state.pinColor;
+  el.pregenChk.checked          = state.pregenThumbnails;
   el.settingsMessage.classList.add('hidden');
   el.settingsOverlay.classList.remove('hidden');
 }
@@ -29,11 +30,12 @@ export function showSettingsMessage(msg, type = 'success') {
 // `onSettingsChanged` is supplied by renderer.js and handles the in-place
 // restart — this module stays focused on UI validation and persistence.
 export async function handleSaveSettings(onSettingsChanged) {
-  const newApiKey     = el.settingsApiKey.value.trim();
-  const newFolder     = el.settingsFolder.value.trim();
-  const newRecursive  = el.settingsRecursive.checked;
-  const newPinColor   = el.settingsPinColor.value;
-  const newShowLabels = el.settingsShowLabels.checked;
+  const newApiKey      = el.settingsApiKey.value.trim();
+  const newFolder      = el.settingsFolder.value.trim();
+  const newRecursive   = el.settingsRecursive.checked;
+  const newPinColor    = el.settingsPinColor.value;
+  const newShowLabels  = el.settingsShowLabels.checked;
+  const newPregen      = el.pregenChk.checked;
 
   if (!newApiKey)  { showSettingsMessage('API key cannot be empty.',      'error'); return; }
   if (!newFolder)  { showSettingsMessage('Please select a photo folder.', 'error'); return; }
@@ -45,14 +47,18 @@ export async function handleSaveSettings(onSettingsChanged) {
   const recursiveUnchanged = newRecursive === state.recursive;
   const storedColor        = (state.meta.pinColor || state.pinColor || DEFAULT_PIN_COLOR).toLowerCase();
   const colorUnchanged     = newPinColor.toLowerCase() === storedColor;
+  const pregenUnchanged    = newPregen    === state.pregenThumbnails;
 
-  if (apiKeyUnchanged && folderUnchanged && recursiveUnchanged && colorUnchanged) {
+  if (apiKeyUnchanged && folderUnchanged && recursiveUnchanged && colorUnchanged && pregenUnchanged) {
     closeSettingsPanel();
     return;
   }
 
+  state.pregenThumbnails = newPregen;
+
   await window.photoMap.saveSettings({
-    apiKey: newApiKey, folderPath: newFolder, recursive: newRecursive, pinColor: newPinColor
+    apiKey: newApiKey, folderPath: newFolder, recursive: newRecursive,
+    pinColor: newPinColor, pregenThumbnails: newPregen
   });
 
   state.meta.pinColor = newPinColor;
@@ -60,9 +66,10 @@ export async function handleSaveSettings(onSettingsChanged) {
 
   await window.photoMap.releaseLock(state.folderPath);
 
-  onSettingsChanged({ newApiKey, newFolder, newRecursive, newPinColor,
+  onSettingsChanged({ newApiKey, newFolder, newRecursive, newPinColor, newPregen,
     apiKeyChanged: !apiKeyUnchanged, folderChanged: !folderUnchanged,
-    recursiveChanged: !recursiveUnchanged, colorChanged: !colorUnchanged });
+    recursiveChanged: !recursiveUnchanged, colorChanged: !colorUnchanged,
+    pregenChanged: !pregenUnchanged });
 }
 
 // Called once by renderer.js during bindAppEvents().
