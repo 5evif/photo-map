@@ -528,3 +528,54 @@ export function setupSidebarResize() {
     window.photoMap.saveSettings({ sidebarWidth: state.sidebarWidth });
   });
 }
+
+// Called once by renderer.js during bindAppEvents().
+export function registerInfoPanelEvents() {
+  // Info panel
+  el.closePanelBtn.addEventListener('click', closeInfoPanel);
+  el.prevPhotoBtn.addEventListener('click', () => navigatePhoto(-1));
+  el.nextPhotoBtn.addEventListener('click', () => navigatePhoto(1));
+  el.renameBtn.addEventListener('click', handleRename);
+  el.renameInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter')  handleRename();
+    if (e.key === 'Escape') closeInfoPanel();
+  });
+  el.showInFinderBtn.addEventListener('click', () => {
+    if (state.activePhoto) window.photoMap.showInFolder(state.activePhoto.filePath);
+  });
+  el.undoRenameBtn.addEventListener('click', handleUndoRename);
+  document.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'z' && state.lastRename) {
+      e.preventDefault();
+      handleUndoRename();
+    }
+  });
+  el.saveNoteBtn.addEventListener('click', handleSaveNote);
+  el.undoNoteBtn.addEventListener('click', handleUndoNote);
+  el.photoNotes.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleSaveNote();
+  });
+  el.setCoordsBtn.addEventListener('click', enterCoordsEditMode);
+  el.saveCoordsBtn.addEventListener('click', handleSaveCoords);
+  el.cancelCoordsBtn.addEventListener('click', exitCoordsEditMode);
+  el.undoCoordsBtn.addEventListener('click', handleUndoCoords);
+  el.clearCoordsBtn.addEventListener('click', handleClearCoordsOverride);
+  el.gpsLatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') handleSaveCoords(); });
+  el.gpsLngInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') handleSaveCoords(); });
+  el.badGpsCheckbox.addEventListener('change', handleBadGpsToggle);
+  el.photoPinColor.addEventListener('change', handlePhotoPinColorChange);
+  el.resetPinColorBtn.addEventListener('click', handleResetPinColor);
+
+  // Lightbox
+  el.zoomBtn.addEventListener('click', openLightbox);
+  el.photoThumbnail.addEventListener('dblclick', openLightbox);
+  el.lightboxClose.addEventListener('click', closeLightbox);
+  el.lightbox.addEventListener('click', (e) => {
+    if (e.target === el.lightbox || e.target === el.lightboxCaption) closeLightbox();
+  });
+  el.lightboxInner.addEventListener('wheel', handleLightboxWheel, { passive: false });
+  setupLightboxDrag();
+
+  // Sidebar resize
+  setupSidebarResize();
+}

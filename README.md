@@ -154,32 +154,6 @@ Click **⚙ Settings** in the toolbar to open the settings panel.
 
 ---
 
-## Your Photos Are Safe
-
-Photo Map is designed to be completely non-destructive. Here is exactly what the app does — and doesn't do — with your files.
-
-### The app never modifies your original photo files
-The only operation that changes a photo file is **Rename**, and that only happens when you explicitly type a new name and confirm it. Even then, only the filename changes — the contents of the file are untouched.
-
-**EXIF data** (the embedded information about date, camera settings, and GPS location) is **read-only**. The app reads GPS coordinates and dates from EXIF when scanning, but never writes anything back into the image file.
-
-### GPS overrides stay in the sidecar file
-When you use the **✎ Set** button to assign or correct coordinates, the new location is saved in `photo-map-data.json` — a separate file alongside your photos — not written back into the image's EXIF. Your original EXIF GPS data is always preserved in the photo file and is always shown as the fallback if you click **✕ Clear** to remove a manual override.
-
-### Thumbnails are stored outside your photo folder
-When Photo Map generates a preview for a photo (particularly for HEIC or DNG files that the browser can't display natively), the preview is saved to a cache folder inside the app's own data area on your computer — **not** inside your photo folder. Clearing the thumbnail cache in Settings removes these files; your originals are unaffected.
-
-### The only files added to your photo folder
-Photo Map creates two files inside your photo folder:
-
-- **`photo-map-data.json`** — stores your notes, GPS flags, pin colours, manual coordinate overrides, and map labels. It is plain human-readable text (JSON format) and travels with your photos if you copy or move the folder.
-- **`photo-map-data.lock`** — a small lock file created when you open the folder and deleted automatically when the app closes. It prevents two people editing the same folder's annotations at the same time. If the app crashes, this file may be left behind in your photo folder; deleting it manually and clicking **Retry** is all that is needed. See *Folder In Use error when opening* in Troubleshooting for details.
-
-### Your photos never leave your computer
-Photo Map does not upload your photos, thumbnails, EXIF data, or annotations to any server. The only network traffic the app makes is requests to MapTiler's tile API to download map imagery (the same as any online map application) and a brief status check when a tile fails to load, to determine whether the issue is an invalid API key or a quota limit. No photo data is included in any of these requests.
-
----
-
 ## Troubleshooting
 
 ### "MapTiler API key error" banner appears
@@ -232,6 +206,32 @@ The photo folder is on a read-only drive or a network share where you do not hav
 
 ---
 
+## Your Photos Are Safe
+
+Photo Map is designed to be completely non-destructive. Here is exactly what the app does — and doesn't do — with your files.
+
+### The app never modifies your original photo files
+The only operation that changes a photo file is **Rename**, and that only happens when you explicitly type a new name and confirm it. Even then, only the filename changes — the contents of the file are untouched.
+
+**EXIF data** (the embedded information about date, camera settings, and GPS location) is **read-only**. The app reads GPS coordinates and dates from EXIF when scanning, but never writes anything back into the image file.
+
+### GPS overrides stay in the sidecar file
+When you use the **✎ Set** button to assign or correct coordinates, the new location is saved in `photo-map-data.json` — a separate file alongside your photos — not written back into the image's EXIF. Your original EXIF GPS data is always preserved in the photo file and is always shown as the fallback if you click **✕ Clear** to remove a manual override.
+
+### Thumbnails are stored outside your photo folder
+When Photo Map generates a preview for a photo (particularly for HEIC or DNG files that the browser can't display natively), the preview is saved to a cache folder inside the app's own data area on your computer — **not** inside your photo folder. Clearing the thumbnail cache in Settings removes these files; your originals are unaffected.
+
+### The only files added to your photo folder
+Photo Map creates two files inside your photo folder:
+
+- **`photo-map-data.json`** — stores your notes, GPS flags, pin colours, manual coordinate overrides, and map labels. It is plain human-readable text (JSON format) and travels with your photos if you copy or move the folder.
+- **`photo-map-data.lock`** — a small lock file created when you open the folder and deleted automatically when the app closes. It prevents two people editing the same folder's annotations at the same time. If the app crashes, this file may be left behind in your photo folder; deleting it manually and clicking **Retry** is all that is needed. See *Folder In Use error when opening* in Troubleshooting for details.
+
+### Your photos never leave your computer
+Photo Map does not upload your photos, thumbnails, EXIF data, or annotations to any server. The only network traffic the app makes is requests to MapTiler's tile API to download map imagery (the same as any online map application) and a brief status check when a tile fails to load, to determine whether the issue is an invalid API key or a quota limit. No photo data is included in any of these requests.
+
+---
+
 ## Technical Reference
 
 This section is for developers and advanced users who want to understand how the app is built or modify it.
@@ -247,7 +247,7 @@ Photo Map is built with [Electron](https://www.electronjs.org/), which packages 
 │  ┌──────────────────────────┐  IPC messages  ┌─────────────────────────┐  │
 │  │      Main Process        │ ◄────────────► │    Renderer Process     │  │
 │  │      (main.js)           │                │    (index.html +        │  │
-│  │                          │  preload.js    │     renderer.js)        │  │
+│  │                          │  preload.js    │     renderer modules)   │  │
 │  │  • Reads/writes files    │  creates a     │                         │  │
 │  │  • Scans EXIF data       │  safe bridge   │  • Leaflet/MapTiler map │  │
 │  │  • Makes thumbnails      │  called        │  • Photo pin markers    │  │
@@ -272,6 +272,24 @@ Photo Map is built with [Electron](https://www.electronjs.org/), which packages 
 - [heic-convert](https://github.com/catdad-experiments/heic-convert) — pure-JavaScript HEIC decoder used as thumbnail fallback
 - [chokidar](https://github.com/paulmillr/chokidar) — watches the photo folder for new or deleted files
 - [electron-store](https://github.com/sindresorhus/electron-store) — persists app settings between sessions
+- [marked](https://marked.js.org/) — renders the in-app README viewer
+
+### Renderer Module Map
+
+The renderer is split into focused ES modules. `renderer.js` is a thin orchestrator; all business logic lives in these modules:
+
+| Module | Responsibility |
+|--------|---------------|
+| `renderer.js` | App init, screen switching, toolbar wiring, global keyboard shortcuts |
+| `scanner.js` | Scan pipeline, folder watching, settings reload, lock-screen helpers |
+| `state.js` | Shared mutable state, DOM refs, constants |
+| `metadata.js` | Read / write `photo-map-data.json`; migration runner |
+| `map.js` | Leaflet init, pin markers, address search |
+| `photoList.js` | Left sidebar photo list, search, filter |
+| `infoPanel.js` | Right info panel, GPS editor, rename, lightbox, sidebar resize |
+| `labels.js` | Map text label placement, editing, persistence |
+| `quickRename.js` | Full-screen rename mode |
+| `settings.js` | Settings overlay, GeoJSON/CSV export, README viewer |
 
 ### Startup Sequence
 1. `main.js` creates the browser window and loads `index.html`.
@@ -281,7 +299,7 @@ Photo Map is built with [Electron](https://www.electronjs.org/), which packages 
 5. The folder is scanned; live progress appears in the status bar.
 6. HEIC/DNG thumbnail generation runs in a background worker thread so the UI stays responsive.
 7. Pins are placed on the map for every photo that has GPS data.
-8. `chokidar` begins watching the folder; adding or removing a photo file triggers a re-scan automatically.
+8. `scanner.js` starts `chokidar` watching the folder; adding or removing a photo file triggers a re-scan automatically.
 
 ### Files Created by the App
 
@@ -308,15 +326,15 @@ When a file is renamed, the renderer re-keys all in-memory annotation data to th
 Open `src/utils.js` and add the extension to the `SUPPORTED_EXTENSIONS` Set. If the browser cannot display the format natively, also add it to `FULL_RES_EXTENSIONS` in `src/main/thumbnail-worker.js` so that a full-resolution thumbnail is generated instead of a resized one.
 
 **Change the pin icon or colour**
-Open `src/renderer/renderer.js` and find the `createPinIcon` function. Change the emoji or HTML. Adjust the `.photo-pin-circle` rule in `src/renderer/styles.css` for sizing and positioning.
+Open `src/renderer/map.js` and find the `createPinIcon` function. Change the emoji or HTML. Adjust the `.photo-pin-circle` rule in `src/renderer/styles.css` for sizing and positioning.
 
 **Change map label appearance**
 Edit the `.map-label` rule in `src/renderer/styles.css`.
 
 **Add a new per-photo annotation field**
-1. Add the field to the default object in `getPhotoMeta()` in `renderer.js`.
+1. Add the field to the default object in `getPhotoMeta()` in `src/renderer/metadata.js`.
 2. Add a UI control in the info panel section of `index.html`.
-3. Wire up save/load logic in `renderer.js` following the pattern used by `note` or `badGps`.
+3. Wire up save/load logic in `src/renderer/infoPanel.js` following the pattern used by `note` or `badGps`.
 4. The new field is automatically included in `photo-map-data.json`.
 
 **App settings storage location**
@@ -337,5 +355,5 @@ Run `npm run build` after replacing icons.
 
 ## About
 
-Build 2.0.0 · 2026-05-16
+Build 2.0.0 · 2026-05-17
 Built by Alex Tyler & Claude
