@@ -24,10 +24,10 @@ import 'leaflet/dist/leaflet.css';
 import { formatLockTimestamp } from '../utils.js';
 import { state, el, qrEl, setStatus } from './state.js';
 import { loadMetadata, saveMetadata, getPhotoMeta } from './metadata.js';
-import { launchMap, placePhotoMarkers, createPhotoMarker, clearPhotoMarkers, fitMapToMarkers, setMarkerHighlight } from './map.js';
+import { launchMap, placePhotoMarkers, createPhotoMarker, clearPhotoMarkers, fitMapToMarkers, setMarkerHighlight, updateTileApiKey, refreshAllMarkerPins } from './map.js';
 import { renderPhotoList } from './photoList.js';
 import { closeInfoPanel, navigatePhoto, enterCoordsEditMode, exitCoordsEditMode, handleSaveCoords, handleUndoCoords, handleClearCoordsOverride, handleSaveNote, handleUndoNote, handleBadGpsToggle, handlePhotoPinColorChange, handleResetPinColor, handleRename, handleUndoRename, openLightbox, closeLightbox, handleLightboxWheel, setupLightboxDrag, applySidebarWidth, setupSidebarResize } from './infoPanel.js';
-import { renderAllLabels, toggleLabelPlacementMode, handleSaveLabel, handleDeleteLabel, closeLabelPopup, showLabelPopupAtLatLng } from './labels.js';
+import { renderAllLabels, clearAllLabels, toggleLabelPlacementMode, handleSaveLabel, handleDeleteLabel, closeLabelPopup, showLabelPopupAtLatLng } from './labels.js';
 import { openQuickRename, closeQuickRename } from './quickRename.js';
 import { openSettingsPanel, closeSettingsPanel, showSettingsMessage, handleSaveSettings, handleExport, openReadme, closeReadme } from './settings.js';
 
@@ -203,6 +203,57 @@ async function handleFolderChange({ type, filePath }) {
   }
 }
 
+// ─── In-place settings apply ──────────────────────────────────────────────────
+//
+// Replaces window.location.reload() after a settings save.  Determines the
+// minimum set of work needed (re-colour only, rescan only, or full re-init)
+// based on which settings actually changed.
+
+async function applyNewSettings({ newApiKey, newFolder, newRecursive, newPinColor,
+  apiKeyChanged, folderChanged, recursiveChanged, colorChanged }) {
+  closeSettingsPanel();
+
+  // Case A: only pin color changed — re-colour all markers in place.
+  if (colorChanged && !apiKeyChanged && !folderChanged && !recursiveChanged) {
+    state.meta.pinColor = newPinColor;
+    state.pinColor      = newPinColor;
+    refreshAllMarkerPins();
+    renderPhotoList();
+    return;
+  }
+
+  // For all other changes, update state and re-initialise the data layer.
+  if (apiKeyChanged) {
+    state.apiKey = newApiKey;
+    updateTileApiKey(newApiKey);
+  }
+
+  state.folderPath = newFolder;
+  state.recursive  = newRecursive;
+  state.pinColor   = newPinColor;
+
+  // Stop watching the old folder and clear all UI state.
+  await window.photoMap.stopWatching();
+  clearPhotoMarkers();
+  clearAllLabels();
+  state.photos      = [];
+  state.activePhoto = null;
+  state.meta        = { version: 1, pinColor: '#4f8ef7', labels: [], photos: {} };
+  closeInfoPanel();
+  setFolderName(newFolder);
+  renderPhotoList();
+
+  // Acquire lock on the new folder.
+  const lockResult = await window.photoMap.acquireLock(newFolder);
+  if (!lockResult.success) { showLockError(lockResult, newFolder); return; }
+
+  // Reload data for the new folder (reuses the existing Leaflet map instance).
+  await loadMetadata();
+  renderAllLabels();
+  await scanAndDisplay();
+  watchFolder();
+}
+
 // ─── Map launch ────────────────────────────────────────────────────────────────
 
 // Passes callbacks into map.js to break the circular-import chain between
@@ -272,8 +323,12 @@ function bindAppEvents() {
   el.settingsBtn.addEventListener('click', openSettingsPanel);
   el.quickRenameBtn.addEventListener('click', openQuickRename);
 
-  // Photo list search & filter buttons
-  el.listSearch.addEventListener('input', renderPhotoList);
+  // Photo list search — debounced so rapid typing coalesces into one render.
+  let _searchTimer = null;
+  el.listSearch.addEventListener('input', () => {
+    clearTimeout(_searchTimer);
+    _searchTimer = setTimeout(renderPhotoList, 150);
+  });
   document.querySelectorAll('.btn-filter').forEach(btn => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.btn-filter').forEach(b => b.classList.remove('active'));
@@ -353,7 +408,7 @@ function bindAppEvents() {
   // Settings overlay
   el.closeSettingsBtn.addEventListener('click', closeSettingsPanel);
   el.cancelSettingsBtn.addEventListener('click', closeSettingsPanel);
-  el.saveSettingsBtn.addEventListener('click', handleSaveSettings);
+  el.saveSettingsBtn.addEventListener('click', () => handleSaveSettings(applyNewSettings));
   el.viewReadmeBtn.addEventListener('click', () => { closeSettingsPanel(); openReadme(); });
   el.settingsBrowseBtn.addEventListener('click', async () => {
     const folder = await window.photoMap.pickFolder();

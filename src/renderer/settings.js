@@ -26,7 +26,9 @@ export function showSettingsMessage(msg, type = 'success') {
   el.settingsMessage.classList.remove('hidden');
 }
 
-export async function handleSaveSettings() {
+// `onSettingsChanged` is supplied by renderer.js and handles the in-place
+// restart — this module stays focused on UI validation and persistence.
+export async function handleSaveSettings(onSettingsChanged) {
   const newApiKey     = el.settingsApiKey.value.trim();
   const newFolder     = el.settingsFolder.value.trim();
   const newRecursive  = el.settingsRecursive.checked;
@@ -58,8 +60,9 @@ export async function handleSaveSettings() {
 
   await window.photoMap.releaseLock(state.folderPath);
 
-  sessionStorage.setItem('skipSetup', '1');
-  window.location.reload();
+  onSettingsChanged({ newApiKey, newFolder, newRecursive, newPinColor,
+    apiKeyChanged: !apiKeyUnchanged, folderChanged: !folderUnchanged,
+    recursiveChanged: !recursiveUnchanged, colorChanged: !colorUnchanged });
 }
 
 // ─── Export ───────────────────────────────────────────────────────────────────

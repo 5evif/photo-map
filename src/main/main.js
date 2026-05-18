@@ -497,6 +497,52 @@ async function enforceThumbnailCacheSize() {
 }
 
 /*
+ * Thumbnail worker pool.
+ *
+ * Caps concurrent thumbnail-worker threads at THUMBNAIL_CONCURRENCY so that
+ * opening many photos quickly (e.g. quick-rename mode) does not spawn an
+ * unbounded number of workers.  Requests beyond the cap are queued and
+ * processed as workers finish.  Each worker's 'exit' event is the single
+ * point that decrements the counter and drains the queue, preventing the
+ * double-decrement that occurred when 'error' and 'exit' both fired.
+ */
+const THUMBNAIL_CONCURRENCY = Math.max(2, Math.min(os.cpus().length - 1, 6));
+const _thumbQueue            = []; // { filePath, thumbPath, resolve }
+let   _activeThumbWorkers    = 0;
+
+function _runNextThumbWorker() {
+  while (_activeThumbWorkers < THUMBNAIL_CONCURRENCY && _thumbQueue.length) {
+    const { filePath, thumbPath, resolve } = _thumbQueue.shift();
+    _activeThumbWorkers++;
+
+    const worker = new Worker(
+      path.join(__dirname, 'thumbnail-worker.js'),
+      { workerData: { filePath, thumbPath } }
+    );
+
+    let result = null;
+
+    worker.on('message', (msg) => {
+      if (msg.success) enforceThumbnailCacheSize(); // fire-and-forget
+      result = msg.success ? msg.thumbPath : null;
+    });
+
+    worker.on('error', (err) => {
+      console.error(`Thumbnail worker error for ${filePath}:`, err.message);
+    });
+
+    // 'exit' always fires last — resolve here so 'message'/'error' have run first.
+    worker.on('exit', (code) => {
+      if (code !== 0 && result === null)
+        console.error(`Thumbnail worker exited with code ${code} for ${filePath}`);
+      resolve(result);
+      _activeThumbWorkers--;
+      _runNextThumbWorker();
+    });
+  }
+}
+
+/*
  * Generates (or retrieves from cache) a JPEG thumbnail for a photo.
  * The actual image processing runs in a separate worker thread so that
  * slow HEIC decoding never freezes the main process or delays the UI.
@@ -514,32 +560,9 @@ async function getThumbnail(filePath) {
   // Return cached version immediately — no worker needed.
   if (fs.existsSync(thumbPath)) return thumbPath;
 
-  // Spawn a worker thread to generate the thumbnail.
-  // Using a thread means HEIC decoding (which can take 1–3 seconds for large
-  // iPhone photos) does not block any other IPC calls or UI updates.
   return new Promise((resolve) => {
-    const worker = new Worker(
-      path.join(__dirname, 'thumbnail-worker.js'),
-      { workerData: { filePath, thumbPath } }
-    );
-
-    worker.on('message', (result) => {
-      if (result.success) enforceThumbnailCacheSize(); // fire-and-forget; don't block the caller
-      resolve(result.success ? result.thumbPath : null);
-    });
-
-    worker.on('error', (err) => {
-      console.error(`Thumbnail worker error for ${filePath}:`, err.message);
-      resolve(null);
-    });
-
-    // If the worker crashes entirely, resolve null so the UI shows gracefully.
-    worker.on('exit', (code) => {
-      if (code !== 0) {
-        console.error(`Thumbnail worker exited with code ${code} for ${filePath}`);
-        resolve(null);
-      }
-    });
+    _thumbQueue.push({ filePath, thumbPath, resolve });
+    _runNextThumbWorker();
   });
 }
 
