@@ -1,6 +1,6 @@
 {
   "name": "photo-map",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Scan a folder of photos, extract GPS coordinates, and view them on a map",
   "main": "src/main/main.js",
   "scripts": {

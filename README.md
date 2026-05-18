@@ -355,5 +355,5 @@ Run `npm run build` after replacing icons.
 
 ## About
 
-Build 2.0.0 · 2026-05-17
+Build 2.0.1 · 2026-05-18
 Built by Alex Tyler & Claude
