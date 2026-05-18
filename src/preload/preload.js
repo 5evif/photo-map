@@ -86,6 +86,22 @@ contextBridge.exposeInMainWorld('photoMap', {
   /** Delete all cached thumbnails to free up disk space. */
   clearThumbnailCache: () => ipcRenderer.invoke('clear-thumbnail-cache'),
 
+  /**
+   * Pre-generates thumbnails for the given file paths (non-native formats only).
+   * Input:   filePaths — array of absolute file paths
+   * Returns: { success, total, done }
+   */
+  pregenThumbnails: (filePaths) => ipcRenderer.invoke('pregen-thumbnails', filePaths),
+
+  /** Cancels an in-progress pre-generate operation. */
+  cancelPregen: () => ipcRenderer.invoke('cancel-pregen'),
+
+  /**
+   * Registers a callback for thumbnail pre-generation progress.
+   * Callback receives { done, total, cancelled? }.
+   */
+  onPregenProgress: (cb) => ipcRenderer.on('pregen-progress', (_, data) => cb(data)),
+
   // ── File Operations ───────────────────────────────────────────────────────────
 
   /**

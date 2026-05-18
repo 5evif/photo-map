@@ -21,6 +21,13 @@ const OVERSCAN          = 5;   // extra rows above and below the visible window
 let _allFiltered     = []; // the current filtered photo array
 let _railEl          = null;  // the fixed-height container for virtual rows
 let _scrollBound     = false; // true once the scroll listener is attached
+let _scrollRafPending = false; // true while a RAF for scroll is queued
+
+function _onScroll() {
+  if (_scrollRafPending) return;
+  _scrollRafPending = true;
+  requestAnimationFrame(() => { _scrollRafPending = false; _renderVirtualWindow(); });
+}
 
 // ─── Filter ───────────────────────────────────────────────────────────────────
 
@@ -126,9 +133,9 @@ export function renderPhotoList() {
   _railEl.style.cssText = `position:relative; height:${filtered.length * ROW_HEIGHT}px;`;
   el.photoListItems.appendChild(_railEl);
 
-  // Attach the scroll listener once; it re-uses _railEl via the closure over module state.
+  // Attach the scroll listener once; RAF-throttled to avoid firing on every pixel.
   if (!_scrollBound) {
-    el.photoListItems.addEventListener('scroll', _renderVirtualWindow, { passive: true });
+    el.photoListItems.addEventListener('scroll', _onScroll, { passive: true });
     _scrollBound = true;
   }
 

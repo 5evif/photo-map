@@ -84,12 +84,13 @@ const { buildGeoJson, buildCsv } = require('./export-format.js');
 // (e.g. ~/Library/Application Support/photo-map/ on macOS)
 const store = new Store({
   defaults: {
-    apiKey:       '',
-    folderPath:   '',
-    recursive:    true,
-    windowBounds: { width: 1280, height: 860 },
-    sidebarWidth: 340,       // Last-used sidebar width, in pixels
-    pinColor:     '#4f8ef7'  // Default photo-pin color
+    apiKey:            '',
+    folderPath:        '',
+    recursive:         true,
+    windowBounds:      { width: 1280, height: 860 },
+    sidebarWidth:      340,
+    pinColor:          '#4f8ef7',
+    pregenThumbnails:  false
   }
 });
 
@@ -320,7 +321,7 @@ async function enforceThumbnailCacheSize() {
  * point that decrements the counter and drains the queue, preventing the
  * double-decrement that occurred when 'error' and 'exit' both fired.
  */
-const THUMBNAIL_CONCURRENCY = Math.max(2, Math.min(os.cpus().length - 1, 6));
+const THUMBNAIL_CONCURRENCY = Math.max(2, Math.min(os.cpus().length - 1, 4));
 const _thumbQueue            = []; // { filePath, thumbPath, resolve }
 let   _activeThumbWorkers    = 0;
 
@@ -383,19 +384,21 @@ async function getThumbnail(filePath) {
 // ─── IPC Handlers ─────────────────────────────────────────────────────────────
 
 ipcMain.handle('get-settings', () => ({
-  apiKey:       store.get('apiKey'),
-  folderPath:   store.get('folderPath'),
-  recursive:    store.get('recursive'),
-  sidebarWidth: store.get('sidebarWidth'),
-  pinColor:     store.get('pinColor')
+  apiKey:            store.get('apiKey'),
+  folderPath:        store.get('folderPath'),
+  recursive:         store.get('recursive'),
+  sidebarWidth:      store.get('sidebarWidth'),
+  pinColor:          store.get('pinColor'),
+  pregenThumbnails:  store.get('pregenThumbnails')
 }));
 
 ipcMain.handle('save-settings', (event, s) => {
-  if (s.apiKey       !== undefined) store.set('apiKey',       s.apiKey);
-  if (s.folderPath   !== undefined) store.set('folderPath',   s.folderPath);
-  if (s.recursive    !== undefined) store.set('recursive',    s.recursive);
-  if (s.sidebarWidth !== undefined) store.set('sidebarWidth', s.sidebarWidth);
-  if (s.pinColor     !== undefined) store.set('pinColor',     s.pinColor);
+  if (s.apiKey            !== undefined) store.set('apiKey',            s.apiKey);
+  if (s.folderPath        !== undefined) store.set('folderPath',        s.folderPath);
+  if (s.recursive         !== undefined) store.set('recursive',         s.recursive);
+  if (s.sidebarWidth      !== undefined) store.set('sidebarWidth',      s.sidebarWidth);
+  if (s.pinColor          !== undefined) store.set('pinColor',          s.pinColor);
+  if (s.pregenThumbnails  !== undefined) store.set('pregenThumbnails',  s.pregenThumbnails);
   return { success: true };
 });
 
@@ -525,6 +528,72 @@ ipcMain.handle('clear-thumbnail-cache', async () => {
     await Promise.all(files.map(f => fs.promises.unlink(path.join(THUMBNAIL_CACHE_DIR, f))));
     return { success: true, count: files.length };
   } catch (err) { return { success: false, error: err.message }; }
+});
+
+// ─── Pre-generate thumbnails ──────────────────────────────────────────────────
+
+// Extensions that require thumbnail generation (not natively displayable by Chromium).
+const PREGEN_EXTENSIONS = new Set(['.heic', '.heif', '.dng']);
+
+let _pregenCancelled = false;
+let _pregenRunning   = false;
+
+/*
+ * Pre-generates JPEG thumbnails for all non-native photos in the given list.
+ * Works in batches of 2 to avoid saturating the worker pool while the app is in use.
+ * Sends 'pregen-progress' events: { done, total, cancelled? }
+ * Sends a final event with done === total (or cancelled: true) on completion.
+ */
+ipcMain.handle('pregen-thumbnails', async (event, filePaths) => {
+  if (_pregenRunning) return { success: false, error: 'Already running' };
+  _pregenRunning   = true;
+  _pregenCancelled = false;
+
+  // Filter to only files that actually need thumbnail generation.
+  const needsThumb = filePaths.filter(fp =>
+    PREGEN_EXTENSIONS.has(path.extname(fp).toLowerCase())
+  );
+
+  // Pre-check cache: skip files that already have a thumbnail.
+  const todo = needsThumb.filter(fp => {
+    const hash      = crypto.createHash('sha1').update(fp).digest('hex');
+    const thumbPath = path.join(THUMBNAIL_CACHE_DIR, hash + '.jpg');
+    return !fs.existsSync(thumbPath);
+  });
+
+  const total = todo.length;
+  let done = 0;
+
+  if (total === 0) {
+    _pregenRunning = false;
+    mainWindow?.webContents.send('pregen-progress', { done: 0, total: 0 });
+    return { success: true, total: 0 };
+  }
+
+  mainWindow?.webContents.send('pregen-progress', { done: 0, total });
+
+  // Process in batches of 2 to share the worker pool without monopolising it.
+  const BATCH = 2;
+  for (let i = 0; i < todo.length; i += BATCH) {
+    if (_pregenCancelled) break;
+    const batch = todo.slice(i, i + BATCH);
+    await Promise.all(batch.map(fp => getThumbnail(fp)));
+    done += batch.length;
+    if (!_pregenCancelled) {
+      mainWindow?.webContents.send('pregen-progress', { done: Math.min(done, total), total });
+    }
+  }
+
+  _pregenRunning = false;
+  if (_pregenCancelled) {
+    mainWindow?.webContents.send('pregen-progress', { done, total, cancelled: true });
+  }
+  return { success: true, total, done };
+});
+
+ipcMain.handle('cancel-pregen', () => {
+  _pregenCancelled = true;
+  return { success: true };
 });
 
 ipcMain.handle('watch-folder', (event, { folderPath, recursive }) => {

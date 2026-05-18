@@ -221,6 +221,42 @@ export function createPinIcon(color) {
   });
 }
 
+export function createWarningPinIcon(color) {
+  return L.divIcon({
+    className: '',
+    html: `<div class="photo-pin-wrapper">
+             <div class="photo-pin-circle" style="background:${color}">⚠</div>
+             <div class="photo-pin-tip" style="border-top-color:${color}"></div>
+           </div>`,
+    iconSize:   [34, 44],
+    iconAnchor: [17, 44],
+    popupAnchor:[0, -44]
+  });
+}
+
+// ─── Panel marker (shown for bad-GPS photos when their panel is open) ──────────
+
+let _panelMarker = null;
+
+export function showPanelMarker(photoData) {
+  hidePanelMarker();
+  if (!state.map) return;
+  const pm = getPhotoMeta(photoData.filePath);
+  if (!pm.badGps) return;
+  const lat = pm.gpsOverride ? pm.gpsOverride.lat : photoData.lat;
+  const lng = pm.gpsOverride ? pm.gpsOverride.lng : photoData.lng;
+  if (lat == null || lng == null) return;
+  _panelMarker = L.marker([lat, lng], {
+    icon: createWarningPinIcon(resolveColor(photoData.filePath)),
+    title: photoData.filename,
+    zIndexOffset: 1000
+  }).addTo(state.map);
+}
+
+export function hidePanelMarker() {
+  if (_panelMarker) { _panelMarker.remove(); _panelMarker = null; }
+}
+
 export async function resolvePhotoDisplayUrl(filePath, filename) {
   const ext = filename.slice(filename.lastIndexOf('.')).toLowerCase();
   if (BROWSER_IMAGE_FORMATS.has(ext)) return window.photoMap.filePathToUrl(filePath);

@@ -219,7 +219,6 @@ async function qrFlushNote() {
       : null,
     noteText:     qrEl.notes.value
   };
-  if (qr.index > 0) qrEl.undoBtn.classList.remove('hidden');
 
   const pm          = getPhotoMeta(photo.filePath);
   const currentNote = qrEl.notes.value;
@@ -283,6 +282,7 @@ async function qrSaveAndNext() {
   qrEl.nameInput.value   = resolvedName.slice(0, -resolvedExt.length);
   qrEl.extSpan.textContent = resolvedExt;
 
+  qrEl.undoBtn.classList.remove('hidden');
   renderPhotoList();
   qrLoadPhoto(qr.index + 1);
 }
@@ -363,5 +363,6 @@ export function closeQuickRename() {
   document.body.style.overflow = '';
   qrEl.img.src         = '';
   qrEl.img.dataset.url = '';
+  renderPhotoList();
   if (state.activePhoto) openInfoPanel(state.activePhoto);
 }
