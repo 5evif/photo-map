@@ -3,7 +3,7 @@
 // Settings overlay (API key, folder, recursive scan, pin color, label toggle),
 // GeoJSON/CSV export, and the README viewer overlay.
 
-import { escapeHtml, markdownToHtml } from '../utils.js';
+import { escapeHtml, markdownToHtml, DEFAULT_PIN_COLOR } from '../utils.js';
 import { state, el } from './state.js';
 import { saveMetadata } from './metadata.js';
 import { setLabelsVisibility } from './labels.js';
@@ -43,7 +43,7 @@ export async function handleSaveSettings(onSettingsChanged) {
   const apiKeyUnchanged    = newApiKey    === state.apiKey;
   const folderUnchanged    = newFolder    === state.folderPath;
   const recursiveUnchanged = newRecursive === state.recursive;
-  const storedColor        = (state.meta.pinColor || state.pinColor || '#4f8ef7').toLowerCase();
+  const storedColor        = (state.meta.pinColor || state.pinColor || DEFAULT_PIN_COLOR).toLowerCase();
   const colorUnchanged     = newPinColor.toLowerCase() === storedColor;
 
   if (apiKeyUnchanged && folderUnchanged && recursiveUnchanged && colorUnchanged) {
@@ -63,6 +63,37 @@ export async function handleSaveSettings(onSettingsChanged) {
   onSettingsChanged({ newApiKey, newFolder, newRecursive, newPinColor,
     apiKeyChanged: !apiKeyUnchanged, folderChanged: !folderUnchanged,
     recursiveChanged: !recursiveUnchanged, colorChanged: !colorUnchanged });
+}
+
+// Called once by renderer.js during bindAppEvents().
+// `onSettingsChanged` is the applyNewSettings function from scanner.js.
+export function registerSettingsEvents(onSettingsChanged) {
+  el.closeSettingsBtn.addEventListener('click', closeSettingsPanel);
+  el.cancelSettingsBtn.addEventListener('click', closeSettingsPanel);
+  el.saveSettingsBtn.addEventListener('click', () => handleSaveSettings(onSettingsChanged));
+  el.viewReadmeBtn.addEventListener('click', () => { closeSettingsPanel(); openReadme(); });
+  el.settingsBrowseBtn.addEventListener('click', async () => {
+    const folder = await window.photoMap.pickFolder();
+    if (folder) el.settingsFolder.value = folder;
+  });
+  el.exportGeoJsonBtn.addEventListener('click', () => handleExport('geojson'));
+  el.exportCsvBtn.addEventListener('click',     () => handleExport('csv'));
+  el.clearCacheBtn.addEventListener('click', async () => {
+    const result = await window.photoMap.clearThumbnailCache();
+    showSettingsMessage(
+      result.success ? `✓ Cleared ${result.count} thumbnails.` : `Error: ${result.error}`,
+      result.success ? 'success' : 'error'
+    );
+  });
+  el.authErrorSettingsLink.addEventListener('click', (e) => { e.preventDefault(); openSettingsPanel(); });
+  el.settingsOverlay.addEventListener('click', (e) => {
+    if (e.target === el.settingsOverlay) closeSettingsPanel();
+  });
+
+  el.closeReadmeBtn.addEventListener('click', closeReadme);
+  el.readmeOverlay.addEventListener('click', (e) => {
+    if (e.target === el.readmeOverlay) closeReadme();
+  });
 }
 
 // ─── Export ───────────────────────────────────────────────────────────────────

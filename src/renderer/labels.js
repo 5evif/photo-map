@@ -148,6 +148,17 @@ export function closeLabelPopup() {
   state.pendingLabelLatLng = null;
 }
 
+// Called once by renderer.js during bindAppEvents().
+export function registerLabelEvents() {
+  el.saveLabelBtn.addEventListener('click', handleSaveLabel);
+  el.deleteLabelBtn.addEventListener('click', handleDeleteLabel);
+  el.closeLabelPopupBtn.addEventListener('click', closeLabelPopup);
+  el.labelTextInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') handleSaveLabel();
+    if (e.key === 'Escape') closeLabelPopup();
+  });
+}
+
 export function setLabelsVisibility(visible) {
   state.labelsVisible = visible;
   for (const { marker } of state.labelMarkers) {

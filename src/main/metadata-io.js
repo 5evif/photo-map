@@ -19,6 +19,38 @@ const fs   = require('fs');
 const METADATA_FILENAME = 'photo-map-data.json';
 const DEFAULT_PIN_COLOR = '#4f8ef7';
 const PIN_COLOR_RE      = /^#[0-9a-f]{6}$/i;
+const CURRENT_VERSION   = 2;
+
+// ─── Migration runner ─────────────────────────────────────────────────────────
+
+/*
+ * Each entry upgrades the metadata object from fromVersion to toVersion.
+ * Entries must be ordered and contiguous (1→2, 2→3, …).
+ */
+const _MIGRATIONS = [
+  {
+    fromVersion: 1,
+    toVersion:   2,
+    // v1 → v2: photo keys are stored as folder-relative forward-slash paths.
+    // The read/write code already handles key translation transparently;
+    // this migration only bumps the version marker so the file is not
+    // re-migrated on every load.
+    run: (meta) => ({ ...meta, version: 2 })
+  }
+];
+
+/*
+ * Applies any pending migrations to a metadata object in sequence.
+ * Input:  meta — the parsed metadata (version field may be outdated)
+ * Returns: metadata at CURRENT_VERSION
+ */
+function applyMigrations(meta) {
+  let m = meta;
+  for (const migration of _MIGRATIONS) {
+    if (m.version < migration.toVersion) m = migration.run(m);
+  }
+  return m;
+}
 
 function metadataFilePath(folderPath) {
   return path.join(folderPath, METADATA_FILENAME);
@@ -90,7 +122,7 @@ function readMetadataFile(folderPath) {
   }
 
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return { version: 1, pinColor: DEFAULT_PIN_COLOR, labels: [], photos: {} };
+    return { version: CURRENT_VERSION, pinColor: DEFAULT_PIN_COLOR, labels: [], photos: {} };
   }
 
   const meta = {
@@ -114,7 +146,7 @@ function readMetadataFile(folderPath) {
     meta.photos[absPath] = sanitized;
   }
 
-  return meta;
+  return applyMigrations(meta);
 }
 
 /*
@@ -160,8 +192,10 @@ function writeMetadataFileAtomic(folderPath, metadata) {
 
 module.exports = {
   METADATA_FILENAME,
+  CURRENT_VERSION,
   isValidLabel,
   sanitizePhotoMeta,
+  applyMigrations,
   readMetadataFile,
   writeMetadataFileAtomic
 };

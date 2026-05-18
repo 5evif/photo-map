@@ -8,15 +8,21 @@
 // They live here alongside `state`/`el` so renderer.js can access `qrEl.overlay`
 // in the global Escape-key handler without importing quickRename.js.
 
+import { DEFAULT_PIN_COLOR } from '../utils.js';
+
+// Kept in sync with CURRENT_VERSION in src/main/metadata-io.js.
+// The renderer cannot import from the main process, so this is the renderer-side copy.
+export const CURRENT_METADATA_VERSION = 2;
+
 export const state = {
   apiKey:       '',
   folderPath:   '',
   recursive:    true,
-  pinColor:     '#4f8ef7',
+  pinColor:     DEFAULT_PIN_COLOR,
 
   meta: {
-    version:  1,
-    pinColor: '#4f8ef7',
+    version:  CURRENT_METADATA_VERSION,
+    pinColor: DEFAULT_PIN_COLOR,
     labels:   [],
     photos:   {}
   },
