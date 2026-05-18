@@ -8,8 +8,8 @@
 //           Cmd/Ctrl+Enter = save note only | Esc = exit (global handler)
 
 import L from 'leaflet';
-import { escapeHtml, getExtension } from '../utils.js';
-import { state, el, qr, qrEl, setStatus, BROWSER_IMAGE_FORMATS, LABEL_FONT_SIZES, MAPTILER_ATTRIBUTION } from './state.js';
+import { escapeHtml, getExtension, BROWSER_IMAGE_FORMATS } from '../utils.js';
+import { state, el, qr, qrEl, setStatus, LABEL_FONT_SIZES, MAPTILER_ATTRIBUTION } from './state.js';
 import { getPhotoMeta, saveMetadata } from './metadata.js';
 import { resolvePhotoDisplayUrl, refreshMarkerPin, resolveColor, createPinIcon } from './map.js';
 import { renderPhotoList } from './photoList.js';

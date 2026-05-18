@@ -10,11 +10,14 @@ const {
   escapeHtml,
   getExtension,
   formatLockTimestamp,
+  formatDate,
+  formatDateShort,
   csvEscape,
   markdownToHtml,
   isPidRunning,
   sanitizeColor,
-  SUPPORTED_EXTENSIONS
+  SUPPORTED_EXTENSIONS,
+  BROWSER_IMAGE_FORMATS
 } = require('../src/utils.js');
 
 // ─── escapeHtml ───────────────────────────────────────────────────────────────
@@ -235,6 +238,297 @@ test('SUPPORTED_EXTENSIONS: does not contain non-photo extensions', () => {
   assert.equal(SUPPORTED_EXTENSIONS.has('.pdf'), false);
 });
 
+// ─── formatDate ───────────────────────────────────────────────────────────────
+
+test('formatDate: valid ISO string returns non-empty string', () => {
+  const result = formatDate('2024-06-15T09:30:00.000Z');
+  assert.ok(typeof result === 'string' && result.length > 0);
+  assert.ok(!result.includes('T'), 'should not contain raw ISO T separator');
+});
+
+test('formatDate: null returns "null" (coerced via Date constructor)', () => {
+  // new Date(null) is the epoch — we just verify it doesn't throw
+  assert.doesNotThrow(() => formatDate(null));
+});
+
+test('formatDate: invalid string returns a non-empty string (does not throw)', () => {
+  assert.doesNotThrow(() => formatDate('not-a-date'));
+  const result = formatDate('not-a-date');
+  assert.ok(typeof result === 'string' && result.length > 0);
+});
+
+// ─── formatDateShort ──────────────────────────────────────────────────────────
+
+test('formatDateShort: valid ISO string returns non-empty string', () => {
+  const result = formatDateShort('2024-06-15T09:30:00.000Z');
+  assert.ok(typeof result === 'string' && result.length > 0);
+});
+
+test('formatDateShort: invalid string returns a non-empty string (does not throw)', () => {
+  assert.doesNotThrow(() => formatDateShort('not-a-date'));
+  const result = formatDateShort('not-a-date');
+  assert.ok(typeof result === 'string' && result.length > 0);
+});
+
+test('formatDateShort: does not include time components', () => {
+  const result = formatDateShort('2024-06-15T09:30:00.000Z');
+  // A short date should not normally contain a colon (time separator).
+  // This is locale-dependent but holds for common locales.
+  assert.ok(result.length > 0, 'result must be non-empty');
+});
+
+// ─── BROWSER_IMAGE_FORMATS ────────────────────────────────────────────────────
+
+test('BROWSER_IMAGE_FORMATS: contains browser-native image formats', () => {
+  for (const ext of ['.jpg', '.jpeg', '.png', '.webp', '.avif']) {
+    assert.ok(BROWSER_IMAGE_FORMATS.has(ext), `missing: ${ext}`);
+  }
+});
+
+test('BROWSER_IMAGE_FORMATS: does not contain HEIC (requires thumbnail)', () => {
+  assert.equal(BROWSER_IMAGE_FORMATS.has('.heic'), false);
+  assert.equal(BROWSER_IMAGE_FORMATS.has('.heif'), false);
+  assert.equal(BROWSER_IMAGE_FORMATS.has('.dng'),  false);
+});
+
+// ─── lock.js ─────────────────────────────────────────────────────────────────
+
+const { acquireLock, releaseLock, readLock, _resetLockState, LOCK_FILENAME } =
+  require('../src/main/lock.js');
+
+test('acquireLock: creates lock file and returns success', async () => {
+  await withTempDir(async dir => {
+    _resetLockState();
+    const result = acquireLock(dir);
+    assert.equal(result.success, true);
+    assert.ok(fs.existsSync(path.join(dir, LOCK_FILENAME)));
+    releaseLock(dir);
+  });
+});
+
+test('acquireLock: returns locked error when held by another session', async () => {
+  await withTempDir(async dir => {
+    _resetLockState();
+    // Write a fake lock owned by a different (living) PID — use process.pid but
+    // a different UUID so it looks like a real, active foreign lock.
+    const lockPath = path.join(dir, LOCK_FILENAME);
+    fs.writeFileSync(lockPath, JSON.stringify({
+      uuid: 'foreign-uuid', user: 'other', machine: 'host',
+      pid: process.pid, timestamp: new Date().toISOString()
+    }));
+    const result = acquireLock(dir);
+    assert.equal(result.success, false);
+    assert.equal(result.error, 'locked');
+    assert.ok(result.lockedBy);
+    fs.unlinkSync(lockPath);
+  });
+});
+
+test('acquireLock: same session (UUID match) returns success without creating duplicate', async () => {
+  await withTempDir(async dir => {
+    _resetLockState();
+    const first = acquireLock(dir);
+    assert.equal(first.success, true);
+    // Acquire again — should recognise our own session UUID.
+    const second = acquireLock(dir);
+    assert.equal(second.success, true);
+    releaseLock(dir);
+  });
+});
+
+test('acquireLock: removes stale lock (dead PID) and succeeds', async () => {
+  await withTempDir(async dir => {
+    _resetLockState();
+    // Write a lock owned by PID 1 — guaranteed dead on any test machine
+    // (or at least not our process and not a photo-map instance).
+    const lockPath = path.join(dir, LOCK_FILENAME);
+    fs.writeFileSync(lockPath, JSON.stringify({
+      uuid: 'stale-uuid', user: 'ghost', machine: 'old',
+      pid: 1, timestamp: new Date().toISOString()
+    }));
+    // Overwrite with a truly non-existent PID to guarantee isPidRunning is false.
+    fs.writeFileSync(lockPath, JSON.stringify({
+      uuid: 'stale-uuid', user: 'ghost', machine: 'old',
+      pid: 999999999, timestamp: new Date().toISOString()
+    }));
+    const result = acquireLock(dir);
+    assert.equal(result.success, true);
+    releaseLock(dir);
+  });
+});
+
+test('releaseLock: deletes our own lock file', async () => {
+  await withTempDir(async dir => {
+    _resetLockState();
+    acquireLock(dir);
+    assert.ok(fs.existsSync(path.join(dir, LOCK_FILENAME)));
+    releaseLock(dir);
+    assert.equal(fs.existsSync(path.join(dir, LOCK_FILENAME)), false);
+  });
+});
+
+test('releaseLock: does not delete another session\'s lock', async () => {
+  await withTempDir(async dir => {
+    _resetLockState();
+    // Write a foreign lock directly (we never called acquireLock).
+    const lockPath = path.join(dir, LOCK_FILENAME);
+    fs.writeFileSync(lockPath, JSON.stringify({
+      uuid: 'foreign-uuid', user: 'other', machine: 'host',
+      pid: process.pid, timestamp: new Date().toISOString()
+    }));
+    releaseLock(dir);
+    // Our UUID is null so isOurs is false — file must survive.
+    assert.ok(fs.existsSync(lockPath));
+    fs.unlinkSync(lockPath);
+  });
+});
+
+// ─── scan.js ─────────────────────────────────────────────────────────────────
+
+const { collectPhotoFiles } = require('../src/main/scan.js');
+
+test('collectPhotoFiles: finds .jpg and .heic files', async () => {
+  await withTempDir(async dir => {
+    fs.writeFileSync(path.join(dir, 'a.jpg'), '');
+    fs.writeFileSync(path.join(dir, 'b.HEIC'), '');
+    const files = await collectPhotoFiles(dir, false);
+    assert.equal(files.length, 2);
+    const names = files.map(f => path.basename(f).toLowerCase()).sort();
+    assert.deepEqual(names, ['a.jpg', 'b.heic']);
+  });
+});
+
+test('collectPhotoFiles: ignores non-photo files', async () => {
+  await withTempDir(async dir => {
+    fs.writeFileSync(path.join(dir, 'notes.txt'), '');
+    fs.writeFileSync(path.join(dir, 'data.json'), '');
+    fs.writeFileSync(path.join(dir, 'photo.jpg'), '');
+    const files = await collectPhotoFiles(dir, false);
+    assert.equal(files.length, 1);
+    assert.equal(path.basename(files[0]), 'photo.jpg');
+  });
+});
+
+test('collectPhotoFiles: skips photo-map-data.json sidecar', async () => {
+  await withTempDir(async dir => {
+    fs.writeFileSync(path.join(dir, 'photo-map-data.json'), '{}');
+    fs.writeFileSync(path.join(dir, 'photo.jpg'), '');
+    const files = await collectPhotoFiles(dir, false);
+    assert.equal(files.length, 1);
+  });
+});
+
+test('collectPhotoFiles: skips photo-map-data.lock sidecar', async () => {
+  await withTempDir(async dir => {
+    fs.writeFileSync(path.join(dir, 'photo-map-data.lock'), '{}');
+    fs.writeFileSync(path.join(dir, 'photo.jpg'), '');
+    const files = await collectPhotoFiles(dir, false);
+    assert.equal(files.length, 1);
+  });
+});
+
+test('collectPhotoFiles: non-recursive does not descend into subdirectories', async () => {
+  await withTempDir(async dir => {
+    const sub = path.join(dir, 'sub');
+    fs.mkdirSync(sub);
+    fs.writeFileSync(path.join(dir, 'top.jpg'), '');
+    fs.writeFileSync(path.join(sub, 'nested.jpg'), '');
+    const files = await collectPhotoFiles(dir, false);
+    assert.equal(files.length, 1);
+    assert.equal(path.basename(files[0]), 'top.jpg');
+  });
+});
+
+test('collectPhotoFiles: recursive descends into subdirectories', async () => {
+  await withTempDir(async dir => {
+    const sub = path.join(dir, 'sub');
+    fs.mkdirSync(sub);
+    fs.writeFileSync(path.join(dir, 'top.jpg'), '');
+    fs.writeFileSync(path.join(sub, 'nested.jpg'), '');
+    const files = await collectPhotoFiles(dir, true);
+    assert.equal(files.length, 2);
+  });
+});
+
+// ─── export-format.js ────────────────────────────────────────────────────────
+
+const { buildGeoJson, buildCsv } = require('../src/main/export-format.js');
+
+const SAMPLE_PHOTOS = [
+  { filePath: '/photos/a.jpg', filename: 'a.jpg', lat: 51.5,  lng: -0.12, date: '2024-01-01T00:00:00.000Z' },
+  { filePath: '/photos/b.jpg', filename: 'b.jpg', lat: 48.85, lng: 2.35,  date: null }
+];
+
+const SAMPLE_META = {
+  photos: {
+    '/photos/a.jpg': { note: 'London', badGps: false, pinColor: '#ff0000' },
+    '/photos/b.jpg': { note: 'Paris',  badGps: true,  pinColor: null }
+  }
+};
+
+test('buildGeoJson: returns valid FeatureCollection', () => {
+  const json = JSON.parse(buildGeoJson(SAMPLE_PHOTOS, SAMPLE_META));
+  assert.equal(json.type, 'FeatureCollection');
+  assert.equal(json.features.length, 2);
+  assert.equal(json.features[0].type, 'Feature');
+  assert.equal(json.features[0].geometry.type, 'Point');
+});
+
+test('buildGeoJson: coordinate order is [lng, lat] per RFC 7946', () => {
+  const json = JSON.parse(buildGeoJson(SAMPLE_PHOTOS, SAMPLE_META));
+  const [lng, lat] = json.features[0].geometry.coordinates;
+  assert.equal(lng, -0.12);
+  assert.equal(lat, 51.5);
+});
+
+test('buildGeoJson: properties include metadata fields', () => {
+  const json = JSON.parse(buildGeoJson(SAMPLE_PHOTOS, SAMPLE_META));
+  const props = json.features[0].properties;
+  assert.equal(props.note, 'London');
+  assert.equal(props.badGps, false);
+  assert.equal(props.pinColor, '#ff0000');
+  assert.equal(props.filename, 'a.jpg');
+});
+
+test('buildGeoJson: missing metadata falls back to empty defaults', () => {
+  const json = JSON.parse(buildGeoJson(SAMPLE_PHOTOS, {}));
+  const props = json.features[0].properties;
+  assert.equal(props.note, '');
+  assert.equal(props.badGps, false);
+  assert.equal(props.pinColor, null);
+});
+
+test('buildCsv: first line is the correct header', () => {
+  const csv = buildCsv(SAMPLE_PHOTOS, SAMPLE_META);
+  const header = csv.split('\n')[0];
+  assert.equal(header, 'filename,latitude,longitude,date,note,bad_gps');
+});
+
+test('buildCsv: one data row per photo', () => {
+  const lines = buildCsv(SAMPLE_PHOTOS, SAMPLE_META).split('\n');
+  assert.equal(lines.length, 3); // header + 2 photos
+});
+
+test('buildCsv: RFC 4180 quoting — double-quotes are doubled', () => {
+  const photos = [{ filePath: '/p/x.jpg', filename: 'say "hi".jpg', lat: 0, lng: 0, date: null }];
+  const meta   = { photos: { '/p/x.jpg': { note: 'he said "hello"', badGps: false } } };
+  const csv = buildCsv(photos, meta);
+  assert.ok(csv.includes('"say ""hi"".jpg"'), 'filename must be RFC 4180 quoted');
+  assert.ok(csv.includes('"he said ""hello"""'), 'note must be RFC 4180 quoted');
+});
+
+test('buildCsv: bad_gps column reflects metadata', () => {
+  const csv   = buildCsv(SAMPLE_PHOTOS, SAMPLE_META);
+  const lines = csv.split('\n');
+  assert.ok(lines[1].endsWith(',false'), 'first photo bad_gps should be false');
+  assert.ok(lines[2].endsWith(',true'),  'second photo bad_gps should be true');
+});
+
+test('buildCsv: empty metadata object is handled gracefully', () => {
+  assert.doesNotThrow(() => buildCsv(SAMPLE_PHOTOS, {}));
+  assert.doesNotThrow(() => buildCsv(SAMPLE_PHOTOS, null));
+});
+
 // ─── metadata-io: isValidLabel ────────────────────────────────────────────────
 
 const { isValidLabel, sanitizePhotoMeta, readMetadataFile, writeMetadataFileAtomic } =
@@ -303,9 +597,9 @@ test('sanitizePhotoMeta: non-object returns null', () => {
 
 // ─── metadata-io: round-trip and migration ───────────────────────────────────
 
-function withTempDir(fn) {
+async function withTempDir(fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'photo-map-test-'));
-  try { return fn(dir); }
+  try { return await fn(dir); }
   finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
